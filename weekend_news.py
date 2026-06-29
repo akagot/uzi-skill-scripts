@@ -5,7 +5,7 @@
 - 当 昨天非交易日 且 明天是交易日 时触发
 - 收集周末/假期消息面
 - 按 利好/利空/中性 映射到 A 股标的
-- 发送飞书分卡片
+- 发送飞书 4 卡片：本周复盘 → 周末消息 → 题材预判 → 下周策略
 """
 
 import os
@@ -17,10 +17,18 @@ import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# ── 共享工具 ──
+sys.path.insert(0, str(Path(__file__).parent))
+from uzi_common import (
+    _http_get_text, send_feishu_card, is_trading_day, make_logger,
+    _theme_heat_safe, _index_quotes, color_chg, fmt_price,
+)
+
 # ── 配置 ──
 LOG_FILE = Path("/tmp/uzi_weekend_news.log")
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/96d30f0a-639b-40c8-8ed5-1028ea80bef9"
 MAX_BYTES = 18000
+log = make_logger(LOG_FILE)
 
 # ── 工具函数 ──
 def log(msg):
@@ -33,36 +41,10 @@ def log(msg):
     except:
         pass
 
+# ── 飞书卡片（转发到 uzi_common） ──
 def send_card(title, content, template="blue"):
-    try:
-        payload = {
-            "msg_type": "interactive",
-            "card": {
-                "header": {"title": {"tag": "plain_text", "content": title}, "template": template},
-                "elements": [{"tag": "markdown", "content": content}]
-            }
-        }
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        if len(body) > MAX_BYTES:
-            paras = content.split("\n\n")
-            half = ""
-            for p in paras:
-                test = half + "\n\n" + p if half else p
-                test_body = json.dumps({"msg_type": "interactive", "card": {"header": {"title": {"tag": "plain_text", "content": title}, "template": template}, "elements": [{"tag": "markdown", "content": test}]}}, ensure_ascii=False).encode("utf-8")
-                if len(test_body) > MAX_BYTES:
-                    break
-                half = test
-            if half:
-                body2 = json.dumps({"msg_type": "interactive", "card": {"header": {"title": {"tag": "plain_text", "content": title}, "template": template}, "elements": [{"tag": "markdown", "content": half + "\n\n(内容过长，已截断)"}]}}, ensure_ascii=False).encode("utf-8")
-                req = urllib.request.Request(FEISHU_WEBHOOK, data=body2, headers={"Content-Type": "application/json"})
-                resp = urllib.request.urlopen(req, timeout=30)
-                log(f"飞书推送(截断)成功: {resp.read().decode()}")
-            return
-        req = urllib.request.Request(FEISHU_WEBHOOK, data=body, headers={"Content-Type": "application/json"})
-        resp = urllib.request.urlopen(req, timeout=30)
-        log(f"飞书推送成功: {resp.read().decode()}")
-    except Exception as e:
-        log(f"飞书推送失败: {e}")
+    """包装 uzi_common.send_feishu_card"""
+    return send_feishu_card(FEISHU_WEBHOOK, title, content, template, MAX_BYTES, log=log)
 
 def send_text(title, content):
     try:
@@ -74,40 +56,34 @@ def send_text(title, content):
     except Exception as e:
         log(f"飞书文本推送失败: {e}")
 
-# ── 交易日判断 ──
-def is_trading_day(date_str):
+# ── 交易日判断（uzi_common 已支持 akshare fallback） ──
+def is_trading_day_local(date_str):
+    """date_str 格式 YYYYMMDD"""
     try:
-        import akshare as ak
-        df = ak.tool_trade_date_hist_sina()
-        trade_dates = set()
-        for d in df["trade_date"].values:
-            if hasattr(d, 'strftime'):
-                trade_dates.add(d.strftime("%Y-%m-%d"))
-            else:
-                trade_dates.add(str(d)[:10])
-        dt = datetime.strptime(date_str, "%Y%m%d")
-        return dt.strftime("%Y-%m-%d") in trade_dates
+        from datetime import datetime as _dt
+        dt = _dt.strptime(date_str, "%Y%m%d")
+        return is_trading_day(dt)
     except Exception as e:
         log(f"交易日判断失败: {e}")
+        # 周末直接返回 False
+        from datetime import datetime as _dt
         try:
-            url = "http://qt.gtimg.cn/q=sh000001"
-            resp = urllib.request.urlopen(url, timeout=10).read().decode("gbk")
-            return '"' in resp and len(resp) > 100
+            d = _dt.strptime(date_str, "%Y%m%d")
+            return d.weekday() < 5
         except:
-            dt = datetime.strptime(date_str, "%Y%m%d")
-            return dt.weekday() < 5
+            return True
 
-# ── 消息面收集 ──
+# ── 消息面收集（使用 uzi_common 带重试的 HTTP 客户端） ──
 def _fetch_json(url, headers=None, timeout=15):
-    if headers is None:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    """JSON 拉取，失败返回 None"""
+    text = _http_get_text(url, timeout=timeout, retries=2, extra_headers=headers)
+    if text is None:
+        log(f"HTTP请求失败 {url[:80]}")
+        return None
     try:
-        req = urllib.request.Request(url, headers=headers)
-        resp = urllib.request.urlopen(req, timeout=timeout)
-        raw = resp.read().decode("utf-8", errors="replace")
-        return json.loads(raw)
-    except Exception as e:
-        log(f"HTTP请求失败 {url[:80]}: {e}")
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        log(f"JSON解析失败 {url[:80]}: {e}")
         return None
 
 def collect_weekend_news():
@@ -333,6 +309,482 @@ def _send_half(items, base_title, template_color, start_num):
             lines.append(f"  <font color='{color}'>{arrow} {d}</font> **{stock_name}**  {chain} · {logic}")
     send_card(f"{base_title}（续）", "\n".join(lines), template_color)
 
+# ═══════════════════════════════════════════════════════════════
+# 卡片 1: 本周复盘
+# ═══════════════════════════════════════════════════════════════
+def card_weekly_review(last_trade_date_str):
+    """
+    本周复盘卡片 - 展示本周最后一个交易日大盘指数表现
+    """
+    log("生成卡片1: 本周复盘...")
+    try:
+        indices = _index_quotes()
+    except Exception as e:
+        log(f"获取指数数据失败: {e}")
+        send_card("📊 本周复盘", "指数数据获取失败，请稍后重试", "blue")
+        return
+
+    if not indices:
+        send_card("📊 本周复盘", "暂无指数数据", "blue")
+        return
+
+    # 解析日期
+    try:
+        dt = datetime.strptime(last_trade_date_str, "%Y%m%d")
+        weekdays_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+        date_display = dt.strftime("%Y年%m月%d日") + f" {weekdays_cn[dt.weekday()]}"
+    except:
+        date_display = last_trade_date_str
+
+    # 计算涨跌统计
+    up_count = sum(1 for idx in indices if (idx.get("chg_pct") or 0) > 0)
+    down_count = sum(1 for idx in indices if (idx.get("chg_pct") or 0) < 0)
+    flat_count = len(indices) - up_count - down_count
+
+    if up_count >= 5:
+        sentiment = "市场情绪偏乐观，主要指数普遍上涨"
+        sentiment_color = "green"
+    elif down_count >= 5:
+        sentiment = "市场情绪偏谨慎，主要指数普遍下跌"
+        sentiment_color = "red"
+    elif up_count > down_count:
+        sentiment = "市场情绪分化，多数指数收涨但仍有分化"
+        sentiment_color = "green"
+    elif down_count > up_count:
+        sentiment = "市场情绪偏弱，多数指数收跌"
+        sentiment_color = "red"
+    else:
+        sentiment = "市场情绪中性，指数涨跌互现"
+        sentiment_color = "orange"
+
+    lines = [
+        f"**{date_display} 大盘指数表现**",
+        "",
+    ]
+
+    for idx in indices:
+        name = idx["name"]
+        price = idx.get("price")
+        chg = idx.get("chg_pct")
+        lines.append(f"• **{name}** {fmt_price(price)}  {color_chg(chg)}")
+
+    lines.append("")
+    lines.append(f"**市场情绪判断：**")
+    lines.append(f"<font color='{sentiment_color}'>{sentiment}</font>")
+    lines.append(f"上涨 {up_count} 只 / 下跌 {down_count} 只 / 持平 {flat_count} 只")
+
+    content = "\n".join(lines)
+    send_card("📊 本周复盘", content, "blue")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 卡片 2: 周末消息
+# ═══════════════════════════════════════════════════════════════
+def card_news(news_stock_map):
+    """
+    周末消息卡片 - 合并利好/利空为一张卡片
+    """
+    log("生成卡片2: 周末消息...")
+
+    # 收集利好和利空
+    bullish_items = []
+    bearish_items = []
+    for item, stocks in news_stock_map:
+        b_stocks = [(s, c, l, d, k) for s, c, l, d, k in stocks if d == "利好"]
+        if b_stocks:
+            bullish_items.append((item, b_stocks))
+        br_stocks = [(s, c, l, d, k) for s, c, l, d, k in stocks if d == "利空"]
+        if br_stocks:
+            bearish_items.append((item, br_stocks))
+
+    lines = []
+
+    # ── 利好消息 ──
+    lines.append("**🟢 利好消息及标的**")
+    lines.append("")
+    if bullish_items:
+        for idx, (item, stocks) in enumerate(bullish_items):
+            title = item.get("title", "")[:80]
+            lines.append(f"**{idx + 1}. {title}**")
+            for stock_name, chain, logic, d, kw in stocks:
+                lines.append(f"  🟢 <font color='green'>利好</font> **{stock_name}**  {chain} · {logic}")
+    else:
+        lines.append("暂无利好消息")
+
+    # ── 利空消息 ──
+    lines.append("")
+    lines.append("**🔴 利空消息及标的**")
+    lines.append("")
+    if bearish_items:
+        for idx, (item, stocks) in enumerate(bearish_items):
+            title = item.get("title", "")[:80]
+            lines.append(f"**{idx + 1}. {title}**")
+            for stock_name, chain, logic, d, kw in stocks:
+                lines.append(f"  🔴 <font color='red'>利空</font> **{stock_name}**  {chain} · {logic}")
+    else:
+        lines.append("暂无利空消息")
+
+    content = "\n".join(lines)
+
+    # 检查是否需要分两半发送
+    test_body = json.dumps({"msg_type": "interactive", "card": {"header": {"title": {"tag": "plain_text", "content": "周末消息面汇总"}, "template": "green"}, "elements": [{"tag": "markdown", "content": content}]}}, ensure_ascii=False).encode("utf-8")
+
+    if len(test_body) > MAX_BYTES:
+        # 分两半：利好部分 + 利空部分
+        log("周末消息内容过长，分两半发送")
+
+        # 上半：利好
+        half1_lines = []
+        half1_lines.append("**🟢 利好消息及标的**")
+        half1_lines.append("")
+        if bullish_items:
+            for idx, (item, stocks) in enumerate(bullish_items):
+                title = item.get("title", "")[:80]
+                half1_lines.append(f"**{idx + 1}. {title}**")
+                for stock_name, chain, logic, d, kw in stocks:
+                    half1_lines.append(f"  🟢 <font color='green'>利好</font> **{stock_name}**  {chain} · {logic}")
+        else:
+            half1_lines.append("暂无利好消息")
+
+        send_card("📰 周末消息面汇总（上）", "\n".join(half1_lines), "green")
+        time.sleep(0.3)
+
+        # 下半：利空
+        half2_lines = []
+        half2_lines.append("**🔴 利空消息及标的**")
+        half2_lines.append("")
+        if bearish_items:
+            for idx, (item, stocks) in enumerate(bearish_items):
+                title = item.get("title", "")[:80]
+                half2_lines.append(f"**{idx + 1}. {title}**")
+                for stock_name, chain, logic, d, kw in stocks:
+                    half2_lines.append(f"  🔴 <font color='red'>利空</font> **{stock_name}**  {chain} · {logic}")
+        else:
+            half2_lines.append("暂无利空消息")
+
+        send_card("📰 周末消息面汇总（下）", "\n".join(half2_lines), "green")
+    else:
+        stats = f"利好 {len(bullish_items)} 条 / 利空 {len(bearish_items)} 条"
+        send_card(f"📰 周末消息面汇总（{stats}）", content, "green")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 卡片 3: 题材预判
+# ═══════════════════════════════════════════════════════════════
+def card_theme_preview(news_stock_map, last_trade_date_str):
+    """
+    题材预判卡片 - 结合消息面 + 上周涨停数据预判下周题材
+    """
+    log("生成卡片3: 题材预判...")
+
+    # ── 1. 从利好消息中提取题材关键词 ──
+    news_topics = set()
+    for item, stocks in news_stock_map:
+        for stock_name, chain, logic, d, kw in stocks:
+            if d == "利好":
+                news_topics.add(kw)
+    news_topics_list = sorted(news_topics) if news_topics else []
+
+    # ── 2. 获取涨停/连板题材 ──
+    try:
+        heat = _theme_heat_safe(last_trade_date_str)
+    except Exception as e:
+        log(f"获取题材热度失败: {e}")
+        heat = None
+
+    up_industries = heat.get("up_industries", []) if heat else []
+    strong_themes = heat.get("strong_themes", {}) if heat else {}
+    hot_sectors = heat.get("hot_sectors", []) if heat else []
+
+    lines = []
+
+    # ── 消息面热点方向 ──
+    lines.append("**消息面热点方向**")
+    lines.append("")
+    if news_topics_list:
+        # 将关键词映射到题材大类
+        topic_map = {
+            "AI智能体": "AI应用", "智能体互联": "AI应用", "光模块": "算力/光通信",
+            "算力出海": "算力/光通信", "太空算力": "算力", "智算": "算力",
+            "半导体": "半导体", "存储": "半导体/存储", "光刻机": "半导体设备",
+            "PCB": "PCB/封装", "先进封装": "PCB/封装",
+            "人形机器人": "机器人", "机器人": "机器人",
+            "卫星互联网": "航天/卫星", "低空经济": "低空经济", "商业航天": "航天/卫星",
+            "锂电": "锂电", "碳酸锂": "锂电", "固态电池": "锂电",
+            "煤炭": "煤炭", "原油": "石油", "油价": "石油",
+            "降息": "金融", "降准": "金融", "美联储": "金融",
+            "折叠屏": "消费电子", "消费电子": "消费电子",
+            "光伏": "光伏", "硅料": "光伏",
+            "创新药": "医药", "减肥药": "医药",
+            "白酒": "白酒/消费", "茅台": "白酒/消费",
+        }
+        mega_topics = {}
+        for kw in news_topics_list:
+            mega = topic_map.get(kw, kw)
+            if mega not in mega_topics:
+                mega_topics[mega] = []
+            mega_topics[mega].append(kw)
+
+        for mega, kws in sorted(mega_topics.items(), key=lambda x: -len(x[1])):
+            lines.append(f"• **{mega}**（{', '.join(kws[:3])}）")
+    else:
+        lines.append("未识别到明确热点方向")
+
+    # ── 上周涨停方向 ──
+    lines.append("")
+    lines.append("**上周涨停行业分布**")
+    lines.append("")
+    if up_industries:
+        for ind, cnt, stocks in up_industries[:8]:
+            top_names = ", ".join(s["name"] for s in stocks[:3])
+            lines.append(f"• **{ind}** {cnt}只涨停 — {top_names}")
+    else:
+        if heat:
+            lines.append(f"涨停池数据源: {heat.get('up_src', '未知')}，涨停 {heat.get('up_count', 0)} 只")
+        else:
+            lines.append("涨停数据获取失败")
+
+    # ── 连板持续题材 ──
+    lines.append("")
+    lines.append("**连板持续题材**")
+    lines.append("")
+    if strong_themes:
+        sorted_themes = sorted(strong_themes.items(), key=lambda x: -x[1]["count"])
+        for ind, info in sorted_themes[:6]:
+            names = ", ".join(s["name"] for s in info["stocks"][:3])
+            lines.append(f"• **{ind}** {info['count']}只连板 — {names}")
+    else:
+        lines.append("暂无连板持续题材")
+
+    # ── 题材延续性判断 ──
+    lines.append("")
+    lines.append("**题材延续性判断**")
+    lines.append("")
+
+    # 将消息关键词映射到题材大类
+    news_mega_topics = set()
+    topic_map = {
+        "AI智能体": "AI应用", "智能体互联": "AI应用", "光模块": "算力/光通信",
+        "算力出海": "算力/光通信", "太空算力": "算力", "智算": "算力",
+        "半导体": "半导体", "存储": "半导体/存储", "光刻机": "半导体设备",
+        "PCB": "PCB/封装", "先进封装": "PCB/封装",
+        "人形机器人": "机器人", "机器人": "机器人",
+        "卫星互联网": "航天/卫星", "低空经济": "低空经济", "商业航天": "航天/卫星",
+        "锂电": "锂电", "碳酸锂": "锂电", "固态电池": "锂电",
+        "煤炭": "煤炭", "原油": "石油", "油价": "石油",
+        "降息": "金融", "降准": "金融", "美联储": "金融",
+        "折叠屏": "消费电子", "消费电子": "消费电子",
+        "光伏": "光伏", "硅料": "光伏",
+        "创新药": "医药", "减肥药": "医药",
+        "白酒": "白酒/消费", "茅台": "白酒/消费",
+    }
+    for kw in news_topics_list:
+        mega = topic_map.get(kw, kw)
+        news_mega_topics.add(mega)
+
+    # 涨停行业
+    limit_industries = set(ind for ind, _, _ in up_industries) if up_industries else set()
+
+    # 连板行业
+    strong_industries = set(strong_themes.keys()) if strong_themes else set()
+
+    # 共振判断
+    resonance = []
+    if news_mega_topics and limit_industries:
+        # 检查消息面与涨停方向的共振（模糊匹配）
+        for news_topic in news_mega_topics:
+            for ind in limit_industries:
+                if news_topic in ind or ind in news_topic or any(
+                    kw in ind for kw in news_topic.split("/")
+                ):
+                    resonance.append(news_topic)
+                    break
+        resonance = list(set(resonance))
+
+    if resonance:
+        lines.append(f"<font color='green'>消息面 + 上周涨停方向共振：{', '.join(resonance)}</font>")
+        lines.append("以上题材下周延续概率较高，重点关注龙头")
+    else:
+        lines.append("<font color='orange'>消息面与上周涨停方向无明显共振</font>")
+        lines.append("关注消息面驱动的新题材启动机会")
+
+    # 连板题材延续性
+    if strong_industries:
+        # 检查连板题材与消息面的持续性
+        sustained = []
+        for ind in strong_industries:
+            for news_topic in news_mega_topics:
+                if news_topic in ind or ind in news_topic or any(
+                    kw in ind for kw in news_topic.split("/")
+                ):
+                    sustained.append(ind)
+                    break
+        sustained = list(set(sustained))
+
+        if sustained:
+            lines.append(f"<font color='green'>连板题材+消息面共振：{', '.join(sustained)}</font>")
+            lines.append("这些题材有消息面支撑，连板行情可能延续")
+        else:
+            lines.append(f"<font color='orange'>连板题材（{', '.join(list(strong_industries)[:5])}）与消息面关联较弱</font>")
+            lines.append("连板题材或以纯情绪博弈为主，需警惕高位风险")
+
+    content = "\n".join(lines)
+    send_card("🔮 题材预判", content, "orange")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 卡片 4: 下周策略
+# ═══════════════════════════════════════════════════════════════
+def card_next_week_strategy(news_stock_map, last_trade_date_str):
+    """
+    下周策略卡片 - 综合研判
+    """
+    log("生成卡片4: 下周策略...")
+
+    # ── 统计多空 ──
+    all_stocks = []
+    for item, stocks in news_stock_map:
+        all_stocks.extend(stocks)
+    bullish_count = sum(1 for _, _, _, d, _ in all_stocks if d == "利好")
+    bearish_count = sum(1 for _, _, _, d, _ in all_stocks if d == "利空")
+    news_with_bullish = sum(1 for item, stocks in news_stock_map if any(d == "利好" for _, _, _, d, _ in stocks))
+    news_with_bearish = sum(1 for item, stocks in news_stock_map if any(d == "利空" for _, _, _, d, _ in stocks))
+
+    # ── 市场情绪判断 ──
+    if bullish_count > bearish_count * 2:
+        sentiment = "消息面偏多，下周开盘情绪乐观"
+        sentiment_color = "green"
+        bias = "偏多"
+    elif bearish_count > bullish_count * 2:
+        sentiment = "消息面偏空，下周开盘需谨慎"
+        sentiment_color = "red"
+        bias = "偏空"
+    elif bullish_count > bearish_count:
+        sentiment = "消息面多空交织，整体偏多但需关注利空扰动"
+        sentiment_color = "green"
+        bias = "偏多"
+    elif bearish_count > bullish_count:
+        sentiment = "消息面多空交织，偏空因素略多"
+        sentiment_color = "red"
+        bias = "偏空"
+    else:
+        sentiment = "消息面多空均衡，方向不明确"
+        sentiment_color = "orange"
+        bias = "中性"
+
+    # ── 提取消息题材关注方向 ──
+    news_topics = set()
+    for item, stocks in news_stock_map:
+        for stock_name, chain, logic, d, kw in stocks:
+            if d == "利好":
+                news_topics.add(kw)
+
+    topic_map = {
+        "AI智能体": "AI应用", "智能体互联": "AI应用", "光模块": "算力/光通信",
+        "算力出海": "算力/光通信", "太空算力": "算力", "智算": "算力",
+        "半导体": "半导体", "存储": "半导体/存储", "光刻机": "半导体设备",
+        "PCB": "PCB/封装", "先进封装": "PCB/封装",
+        "人形机器人": "机器人", "机器人": "机器人",
+        "卫星互联网": "航天/卫星", "低空经济": "低空经济", "商业航天": "航天/卫星",
+        "锂电": "锂电", "碳酸锂": "锂电", "固态电池": "锂电",
+        "煤炭": "煤炭", "原油": "石油", "油价": "石油",
+        "降息": "金融", "降准": "金融", "美联储": "金融",
+        "折叠屏": "消费电子", "消费电子": "消费电子",
+        "光伏": "光伏", "硅料": "光伏",
+        "创新药": "医药", "减肥药": "医药",
+        "白酒": "白酒/消费", "茅台": "白酒/消费",
+    }
+    mega_topics = {}
+    for kw in news_topics:
+        mega = topic_map.get(kw, kw)
+        if mega not in mega_topics:
+            mega_topics[mega] = set()
+        mega_topics[mega].add(kw)
+
+    focus_directions = sorted(mega_topics.keys(), key=lambda x: -len(mega_topics[x]))
+
+    # ── 组装卡片 ──
+    try:
+        dt = datetime.strptime(last_trade_date_str, "%Y%m%d")
+        weekdays_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+        date_display = dt.strftime("%Y年%m月%d日") + f" {weekdays_cn[dt.weekday()]}"
+    except:
+        date_display = last_trade_date_str
+
+    lines = [
+        f"**综合研判 · {date_display} 收盘**",
+        "",
+        "**市场情绪判断**",
+        f"<font color='{sentiment_color}'>{sentiment}</font>",
+        f"",
+        f"**多空分布：**",
+        f"• 利好消息：{news_with_bullish} 条 → 涉及 {bullish_count} 只标的",
+        f"• 利空消息：{news_with_bearish} 条 → 涉及 {bearish_count} 只标的",
+        "",
+        "**下周关注方向**",
+    ]
+
+    if focus_directions:
+        for i, d in enumerate(focus_directions[:6]):
+            lines.append(f"• **{d}** — 消息面驱动，关注龙头表现")
+    else:
+        if bias == "偏多":
+            lines.append("• 关注消息面利好板块的补涨机会")
+        elif bias == "偏空":
+            lines.append("• 关注防御性板块（银行、公用事业、红利）")
+        else:
+            lines.append("• 关注消息面个股机会，整体以震荡思路对待")
+
+    lines.append("")
+    lines.append("**操作思路**")
+    lines.append("")
+
+    if bias == "偏多":
+        lines.append("• 开盘关注利好板块龙头股表现，观察量能配合")
+        lines.append("• 高开勿追，回调低吸为主")
+        lines.append("• 关注连板题材的延续性，龙头断板即减仓")
+        lines.append("• 仓位可适度提升至 6-7 成")
+    elif bias == "偏空":
+        lines.append("• 开盘后注意利空板块风险，及时减仓或回避")
+        lines.append("• 关注防御性板块（银行、公用事业、红利ETF）")
+        lines.append("• 仓位控制在 3-4 成，等待企稳信号")
+        lines.append("• 连板高标注意高位风险，避免追高")
+    else:
+        lines.append("• 多空交织，控制仓位在 5 成左右")
+        lines.append("• 关注消息面驱动板块的轮动节奏")
+        lines.append("• 利好板块高开不追，等回调确认")
+        lines.append("• 利空板块若低开过多可关注超跌反弹")
+
+    lines.append("")
+    lines.append("---")
+    lines.append("数据来源：新浪财经 · 自动化生成")
+    lines.append("声明：以上内容仅供市场信息参考，不构成任何投资建议")
+
+    content = "\n".join(lines)
+    send_card("🧠 下周策略", content, "purple")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 查找最近一个交易日
+# ═══════════════════════════════════════════════════════════════
+def _find_last_trading_day(today):
+    """从 today 往前找最近一个交易日，返回 YYYYMMDD 字符串"""
+    for days_back in range(1, 15):
+        d = today - timedelta(days=days_back)
+        ds = d.strftime("%Y%m%d")
+        try:
+            if is_trading_day(d):
+                log(f"最近交易日: {ds}")
+                return ds
+        except Exception as e:
+            log(f"交易日判断失败 {ds}: {e}")
+            if d.weekday() < 5:
+                return ds
+    # 兜底：返回上周五
+    d = today - timedelta(days=max(1, today.weekday() - 4))
+    return d.strftime("%Y%m%d")
+
+
 # ── 主流程 ──
 def main():
     log("=" * 60)
@@ -383,69 +835,28 @@ def main():
     bearish_count = sum(1 for _, _, _, d, _ in all_stocks if d == "利空")
     neutral_count = sum(1 for _, _, _, d, _ in all_stocks if d == "中性")
 
-    news_with_bullish = sum(1 for item, stocks in news_stock_map if any(d == "利好" for _, _, _, d, _ in stocks))
-    news_with_bearish = sum(1 for item, stocks in news_stock_map if any(d == "利空" for _, _, _, d, _ in stocks))
-    news_with_neutral = sum(1 for item, stocks in news_stock_map if any(d == "中性" for _, _, _, d, _ in stocks))
+    log(f"消息统计: 利好 {bullish_count} 只, 利空 {bearish_count} 只, 中性 {neutral_count} 只")
 
-    weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-    wd = weekdays[today.weekday()]
-    date_display = today.strftime("%Y年%m月%d日") + f" {wd}"
+    # 3. 查找最近一个交易日（用于指数和题材数据）
+    last_trade_date = _find_last_trading_day(today)
 
-    # 3. 卡片1: 概览
-    overview = f"""**{date_display} 周末/假期消息面汇总**
-
-窗口：周末/假期 → 开盘前
-
-消息总数：{len(news_items)} 条 | 关联标的：{len(set(s for s, _, _, _, _ in all_stocks))} 只
-
-<font color='green'>▸ 利好：{news_with_bullish} 条消息 | {bullish_count} 只标的</font>
-<font color='red'>▸ 利空：{news_with_bearish} 条消息 | {bearish_count} 只标的</font>
-<font color='orange'>▸ 中性/待观察：{news_with_neutral} 条消息 | {neutral_count} 只标的</font>
-
-数据来源：新浪财经 | 自动化生成"""
-    send_card("📊 周末消息面概览", overview, "blue")
+    # 4. 卡片 1: 本周复盘 (blue)
+    card_weekly_review(last_trade_date)
     time.sleep(0.5)
 
-    # 4. 卡片2-4: 方向
-    build_direction_cards(news_stock_map, "利好", "green")
-    time.sleep(0.5)
-    build_direction_cards(news_stock_map, "利空", "red")
-    time.sleep(0.5)
-    build_direction_cards(news_stock_map, "中性", "orange")
+    # 5. 卡片 2: 周末消息 (green) - 合并利好/利空
+    card_news(news_stock_map)
     time.sleep(0.5)
 
-    # 5. 卡片5: 研判
-    if bullish_count > bearish_count * 2:
-        sentiment = "消息面偏多，下周开盘情绪乐观"
-        color = "green"
-    elif bearish_count > bullish_count * 2:
-        sentiment = "消息面偏空，下周开盘需谨慎"
-        color = "red"
-    else:
-        sentiment = "消息面多空交织，关注具体板块机会"
-        color = "orange"
+    # 6. 卡片 3: 题材预判 (orange)
+    card_theme_preview(news_stock_map, last_trade_date)
+    time.sleep(0.5)
 
-    judgment = f"""**下周开盘研判**
+    # 7. 卡片 4: 下周策略 (purple)
+    card_next_week_strategy(news_stock_map, last_trade_date)
 
-综合情绪：<font color='{color}'>{sentiment}</font>
+    log("周末消息面汇总完成（4 卡片）")
 
-**利好/利空分布：**
-• 利好消息：{news_with_bullish} 条 → 涉及 {bullish_count} 只标的
-• 利空消息：{news_with_bearish} 条 → 涉及 {bearish_count} 只标的
-• 中性消息：{news_with_neutral} 条 → 涉及 {neutral_count} 只标的
-
-**操作建议：**
-▸ 利好板块：开盘关注龙头股表现
-▸ 利空板块：开盘后注意风险，避开弱势股
-▸ 利好/利空并存：根据产业链上下游判断传导
-▸ 开盘后30分钟：观察量能是否配合
-
----
-数据来源：新浪财经
-声明：以上内容仅供市场信息参考，不构成任何投资建议"""
-    send_card("🧠 下周研判", judgment, "purple")
-
-    log("周末消息面汇总完成")
 
 if __name__ == "__main__":
     try:

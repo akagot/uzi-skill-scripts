@@ -4,7 +4,7 @@
 - 交易日早上 8:40 执行
 - 收集美股隔夜行情 + 盘前消息面
 - 消息面利好/利空/中性映射到 A 股标的
-- 发送 6 张飞书分卡片
+- 发送 4 张飞书分卡片：隔夜外盘 / 盘前消息 / 题材预判 / 早盘研判
 """
 
 import os
@@ -16,10 +16,15 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+# ── 共享工具 ──
+sys.path.insert(0, str(Path(__file__).parent))
+from uzi_common import _http_get_text, send_feishu_card, is_trading_day, make_logger, _theme_heat_safe, _index_quotes
+
 # ── 配置 ──
 LOG_FILE = Path("/tmp/uzi_morning_briefing.log")
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/96d30f0a-639b-40c8-8ed5-1028ea80bef9"
 MAX_BYTES = 18000
+log = make_logger(LOG_FILE)
 
 # ── 日志 ──
 def log(msg):
@@ -32,47 +37,22 @@ def log(msg):
     except:
         pass
 
-# ── 飞书卡片 ──
+# ── 飞书卡片（转发到 uzi_common） ──
 def send_card(title, content, template="blue"):
-    try:
-        payload = {
-            "msg_type": "interactive",
-            "card": {
-                "header": {"title": {"tag": "plain_text", "content": title}, "template": template},
-                "elements": [{"tag": "markdown", "content": content}]
-            }
-        }
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        if len(body) > MAX_BYTES:
-            paras = content.split("\n\n")
-            half = ""
-            for p in paras:
-                test = half + "\n\n" + p if half else p
-                test_body = json.dumps({"msg_type": "interactive", "card": {"header": {"title": {"tag": "plain_text", "content": title}, "template": template}, "elements": [{"tag": "markdown", "content": test}]}}, ensure_ascii=False).encode("utf-8")
-                if len(test_body) > MAX_BYTES:
-                    break
-                half = test
-            if half:
-                body2 = json.dumps({"msg_type": "interactive", "card": {"header": {"title": {"tag": "plain_text", "content": title}, "template": template}, "elements": [{"tag": "markdown", "content": half + "\n\n(内容过长，已截断)"}]}}, ensure_ascii=False).encode("utf-8")
-                req = urllib.request.Request(FEISHU_WEBHOOK, data=body2, headers={"Content-Type": "application/json"})
-                urllib.request.urlopen(req, timeout=30)
-            return
-        req = urllib.request.Request(FEISHU_WEBHOOK, data=body, headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=30)
-        log(f"飞书推送成功: {title}")
-    except Exception as e:
-        log(f"飞书推送失败: {e}")
+    """包装 uzi_common.send_feishu_card"""
+    return send_feishu_card(FEISHU_WEBHOOK, title, content, template, MAX_BYTES, log=log)
 
-# ── 工具函数 ──
+# ── 工具函数（使用 uzi_common 带重试的 HTTP 客户端） ──
 def _fetch_json(url, timeout=15, headers=None):
-    if headers is None:
-        headers = {"User-Agent": "Mozilla/5.0"}
+    """JSON 拉取，失败返回 None"""
+    text = _http_get_text(url, timeout=timeout, retries=2, extra_headers=headers)
+    if text is None:
+        log(f"HTTP请求失败 {url[:80]}")
+        return None
     try:
-        req = urllib.request.Request(url, headers=headers)
-        resp = urllib.request.urlopen(req, timeout=timeout)
-        return json.loads(resp.read().decode("utf-8", errors="replace"))
-    except Exception as e:
-        log(f"HTTP请求失败 {url[:80]}: {e}")
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        log(f"JSON解析失败 {url[:80]}: {e}")
         return None
 
 def _color_tag(direction):
@@ -80,106 +60,58 @@ def _color_tag(direction):
     arrow_map = {"利好": "🟢", "利空": "🔴", "中性": "🟡"}
     return f"<font color='{color_map[direction]}'>{arrow_map[direction]} {direction}</font>"
 
-# ── 交易日判断 ──
-def is_trading_day(date_str):
+# ── 交易日判断（uzi_common 已支持 akshare fallback） ──
+def is_trading_day_local(date_str):
+    """date_str 格式 YYYYMMDD"""
     try:
-        import akshare as ak
-        df = ak.tool_trade_date_hist_sina()
-        trade_dates = set()
-        for d in df["trade_date"].values:
-            if hasattr(d, 'strftime'):
-                trade_dates.add(d.strftime("%Y-%m-%d"))
-            else:
-                trade_dates.add(str(d)[:10])
-        dt = datetime.strptime(date_str, "%Y%m%d")
-        return dt.strftime("%Y-%m-%d") in trade_dates
+        from datetime import datetime as _dt
+        dt = _dt.strptime(date_str, "%Y%m%d")
+        return is_trading_day(dt)
     except Exception as e:
         log(f"交易日判断失败: {e}")
-        try:
-            url = "http://qt.gtimg.cn/q=sh000001"
-            resp = urllib.request.urlopen(url, timeout=10).read().decode("gbk")
-            return '"' in resp and len(resp) > 100
-        except:
-            dt = datetime.strptime(date_str, "%Y%m%d")
-            return dt.weekday() < 5
+        return True
 
-# ── 美股隔夜行情 ──
+# ── 美股隔夜行情（腾讯 qt 三市场）──
 def get_us_overnight():
-    """获取美股隔夜行情：三大指数 + 重点个股 + 板块ETF"""
-    log("收集美股隔夜行情...")
+    """美股隔夜：5 大指数 + 13 科技龙头 + 11 板块 ETF
+    数据源：qt.gtimg.cn (uzicommon) 一次拉取，无需 yfinance
+    """
+    from uzi_common import US_SECTOR_ETFS, US_TECH_LEADERS, _us_quotes_batch, _us_sector_etf_quotes
+    from datetime import datetime
     result = {"indices": [], "stocks": [], "sectors": [], "is_closed": False}
-
-    now = datetime.now()
-    result["is_closed"] = now.weekday() >= 5  # 周六=5, 周日=6
-
     try:
-        # 1. 美股指数
-        url = "https://push2.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=20&pn=1&np=1&fltt=2&invt=2&fs=m:105,m:106,m:107&fields=f2,f3,f4,f12,f14"
-        data = _fetch_json(url)
-        if data and data.get("data", {}).get("diff"):
-            items = data["data"]["diff"]
-            name_map = {
-                "100.DJIA": "道琼斯", "100.NDX": "纳斯达克100", "100.SPX": "标普500",
-                "100.VIX": "VIX恐慌指数", "100.RUT": "罗素2000",
-            }
-            for item in items:
-                code = item.get("f12", "")
-                name = item.get("f14", "")
-                display_name = name_map.get(code, name)
-                if display_name in ("道琼斯", "纳斯达克100", "标普500", "VIX恐慌指数", "罗素2000"):
-                    result["indices"].append({
-                        "name": display_name,
-                        "price": item.get("f2", 0),
-                        "chg_pct": item.get("f3", 0),
-                    })
-            log(f"美股指数: {len(result['indices'])} 个")
+        # 美股周六周日 closed
+        result["is_closed"] = datetime.now().weekday() >= 5
 
-        # 2. 美股重点个股
-        url2 = "https://push2.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=30&pn=1&np=1&fltt=2&invt=2&fs=b:MK0148&fields=f2,f3,f4,f12,f14"
-        data2 = _fetch_json(url2)
-        if data2 and data2.get("data", {}).get("diff"):
-            key_stocks = {"AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AMD", "INTC", "MU", "AVGO", "SMCI", "ARM", "TSM", "ASML", "BABA", "JD", "PDD", "NIO", "XPEV", "LI", "BIDU"}
-            for item in data2["data"]["diff"]:
-                code = item.get("f12", "")
-                if code in key_stocks:
-                    result["stocks"].append({
-                        "code": code, "name": item.get("f14", ""),
-                        "price": item.get("f2", 0), "chg_pct": item.get("f3", 0)
-                    })
-            log(f"美股重点个股: {len(result['stocks'])} 只")
+        # 1. 美股 5 大指数
+        index_codes = ["DJI", "IXIC", "SPX", "VIX", "RUT"]
+        index_names = {"DJI": "道琼斯", "IXIC": "纳斯达克100", "SPX": "标普500", "VIX": "VIX恐慌指数", "RUT": "罗素2000"}
+        pairs = [(c, "U") for c in index_codes]
+        qs = _us_quotes_batch([c for c, _ in pairs])
+        for q in qs:
+            cn = index_names.get(q.get("code", ""), q.get("name", ""))
+            result["indices"].append({"name": cn, "price": q.get("price"), "chg_pct": q.get("change_pct")})
+        log(f"美股指数: {len(result['indices'])} 个")
 
-        # 3. 美股板块ETF（yfinance 兜底）
-        sector_etfs = {
-            "XLK": "科技ETF", "XLF": "金融ETF", "XLE": "能源ETF",
-            "XLV": "医疗ETF", "XLI": "工业ETF", "XLY": "消费ETF",
-            "SMH": "半导体ETF", "XBI": "生物科技ETF", "XRT": "零售ETF",
-            "GLD": "黄金ETF", "USO": "原油ETF",
-        }
-        try:
-            import yfinance as yf
-            symbols = list(sector_etfs.keys())
-            tickers = yf.Tickers(" ".join(symbols))
-            for sym in symbols:
-                try:
-                    t = tickers.tickers.get(sym)
-                    if t:
-                        info = t.info
-                        prev = info.get("previousClose", 0)
-                        price = info.get("currentPrice") or info.get("regularMarketPrice", 0)
-                        if prev and price:
-                            chg = (price - prev) / prev * 100
-                            result["sectors"].append({
-                                "name": sector_etfs[sym], "chg_pct": round(chg, 2)
-                            })
-                except:
-                    pass
-            log(f"美股板块ETF: {len(result['sectors'])} 个")
-        except Exception as e:
-            log(f"yfinance板块ETF获取失败: {e}")
+        # 2. 美股 13 科技龙头
+        tech_codes = [c for c, _ in US_TECH_LEADERS]
+        tech_qs = _us_quotes_batch(tech_codes)
+        by_code = {q["code"]: q for q in tech_qs}
+        for c, name in US_TECH_LEADERS:
+            q = by_code.get(c)
+            if q:
+                result["stocks"].append({
+                    "code": c, "name": name,
+                    "price": q.get("price"), "chg_pct": q.get("change_pct"),
+                })
+        log(f"美股重点个股: {len(result['stocks'])} 只")
 
+        # 3. 美股板块 ETF
+        for s in _us_sector_etf_quotes():
+            result["sectors"].append({"name": s["name"], "chg_pct": s.get("chg_pct")})
+        log(f"美股板块ETF: {len(result['sectors'])} 个")
     except Exception as e:
         log(f"美股行情获取失败: {e}")
-
     return result
 
 # ── 盘前消息收集 ──
@@ -512,6 +444,334 @@ def _send_half(items, base_title, template_color, start_num):
             lines.append(f"  {_color_tag(d)} **{stock_name}**  {chain} · {logic}")
     send_card(f"{base_title}（续）", "\n".join(lines), template_color)
 
+# ── 卡片1: 隔夜外盘（合并早盘概览 + 美股映射） ──
+def card_overview(us_data, news_items, all_stocks, bullish_count, bearish_count, neutral_count):
+    """合并原来的 Card 1 (早盘概览) + Card 2 (美股映射) 为一张卡片"""
+    # ── 美股情绪判断 ──
+    major_indices = [idx for idx in us_data.get("indices", []) if idx["name"] in ("道琼斯", "纳斯达克100", "标普500")]
+    if major_indices:
+        avg_chg = sum(idx["chg_pct"] for idx in major_indices) / len(major_indices)
+        if avg_chg > 0.3:
+            us_verdict = "美股隔夜全面收涨，情绪偏暖，利好A股开盘"
+        elif avg_chg < -0.3:
+            us_verdict = "美股隔夜全面收跌，情绪偏冷，A股开盘承压"
+        else:
+            us_verdict = "美股隔夜窄幅震荡，情绪中性，A股开盘震荡"
+    elif us_data.get("is_closed"):
+        us_verdict = "美股周末休市，关注上周五收盘数据"
+    else:
+        us_verdict = "美股行情数据获取中..."
+
+    # ── 日期 ──
+    today = datetime.now()
+    weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    wd = weekdays[today.weekday()]
+    date_display = today.strftime("%Y年%m月%d日") + f" {wd}"
+
+    # ── 构建内容 ──
+    lines = []
+    lines.append(f"**{date_display} 早盘简报**")
+    lines.append("")
+    lines.append(f"**{us_verdict}**")
+    lines.append("")
+
+    # 盘前消息统计
+    lines.append(f"盘前消息：{len(news_items)} 条 | 关联标的：{len(set(s for s, _, _, _, _ in all_stocks))} 只")
+    lines.append(f"<font color='green'>▸ 利好：{bullish_count} 只标的</font>")
+    lines.append(f"<font color='red'>▸ 利空：{bearish_count} 只标的</font>")
+    lines.append(f"<font color='orange'>▸ 中性：{neutral_count} 只标的</font>")
+    lines.append("")
+
+    # ── 美股三大指数 ──
+    if us_data.get("indices"):
+        lines.append("**━━━ 美股三大指数 ━━━**")
+        for idx in us_data["indices"]:
+            if idx["name"] in ("道琼斯", "纳斯达克100", "标普500"):
+                color = "green" if idx["chg_pct"] >= 0 else "red"
+                arrow = "📈" if idx["chg_pct"] >= 0 else "📉"
+                if idx["price"] is not None and idx["chg_pct"] is not None:
+                    lines.append(f"  {arrow} <font color='{color}'>{idx['name']}</font>: {idx['price']:.2f} ({idx['chg_pct']:+.2f}%)")
+                elif idx["chg_pct"] is not None:
+                    lines.append(f"  {arrow} <font color='{color}'>{idx['name']}</font>: {idx['chg_pct']:+.2f}%")
+        lines.append("")
+
+    # ── 美股科技龙头 → A股映射 ──
+    us_to_a = {
+        "NVDA": ("寒武纪(688256)", "中际旭创(300308)"),
+        "AAPL": ("立讯精密(002475)", "蓝思科技(300433)"),
+        "TSLA": ("拓普集团(601689)", "三花智控(002050)"),
+        "MSFT": ("金山办公(688111)", "科大讯飞(002230)"),
+        "MU": ("兆易创新(603986)", "江波龙(301308)"),
+        "AMD": ("通富微电(002156)", "中科曙光(603019)"),
+        "ASML": ("北方华创(002371)", "中微公司(688012)"),
+        "GOOGL": ("中文在线(300364)", "蓝色光标(300058)"),
+        "META": ("蓝色光标(300058)", "易点天下(301171)"),
+        "AMZN": ("跨境通(002640)", "焦点科技(002315)"),
+        "BABA": ("阿里巴巴(BABA)", "腾讯控股(00700.HK)"),
+        "PDD": ("阿里巴巴(BABA)", "京东(JD)"),
+        "JD": ("京东(JD)", "阿里巴巴(BABA)"),
+        "NIO": ("比亚迪(002594)", "长城汽车(601633)"),
+        "XPEV": ("比亚迪(002594)", "长城汽车(601633)"),
+        "BIDU": ("中文在线(300364)", "三六零(601360)"),
+    }
+    if us_data.get("stocks"):
+        lines.append("**━━━ 科技龙头 → A股映射 ━━━**")
+        for stock in us_data["stocks"][:10]:
+            code = stock["code"]
+            a_stocks = us_to_a.get(code, [])
+            if a_stocks and stock["chg_pct"] is not None:
+                color = "green" if stock["chg_pct"] >= 0 else "red"
+                arrow = "📈" if stock["chg_pct"] >= 0 else "📉"
+                lines.append(f"  {arrow} <font color='{color}'>{stock['name']}({code})</font> {stock['chg_pct']:+.2f}% → {', '.join(a_stocks)}")
+        lines.append("")
+
+    # ── 板块ETF ──
+    if us_data.get("sectors"):
+        lines.append("**━━━ 板块ETF ━━━**")
+        for s in us_data["sectors"][:8]:
+            if s["chg_pct"] is not None:
+                color = "green" if s["chg_pct"] >= 0 else "red"
+                lines.append(f"  <font color='{color}'>{s['name']}</font> {s['chg_pct']:+.2f}%")
+        lines.append("")
+
+    lines.append("数据来源：金十数据 | 东财快讯 | 新浪全球宏观 | 自动化生成")
+    content = "\n".join(lines)
+    send_card("🌍 隔夜外盘", content, "blue")
+
+
+# ── 卡片2: 盘前消息（合并利好/利空/中性三张卡片为一张） ──
+def card_news(news_stock_map):
+    """合并原来的 3 张方向卡片为一张盘前消息卡片"""
+    # 分别收集利好/利空/中性
+    bullish = []
+    bearish = []
+    neutral = []
+    for item, stocks in news_stock_map:
+        bull_stocks = [(s, c, l, d, k) for s, c, l, d, k in stocks if d == "利好"]
+        bear_stocks = [(s, c, l, d, k) for s, c, l, d, k in stocks if d == "利空"]
+        neut_stocks = [(s, c, l, d, k) for s, c, l, d, k in stocks if d == "中性"]
+        if bull_stocks:
+            bullish.append((item, bull_stocks))
+        if bear_stocks:
+            bearish.append((item, bear_stocks))
+        if neut_stocks:
+            neutral.append((item, neut_stocks))
+
+    lines = []
+
+    # ── 利好消息 ──
+    lines.append("**━━━ 🟢 利好消息及标的 ━━━**")
+    if bullish:
+        for idx, (item, stocks) in enumerate(bullish):
+            title = item.get("title", "")[:80]
+            if idx > 0:
+                lines.append("")
+            lines.append(f"**{idx + 1}. {title}**")
+            for stock_name, chain, logic, d, kw in stocks:
+                lines.append(f"  {_color_tag(d)} **{stock_name}**  {chain} · {logic}")
+    else:
+        lines.append("暂无利好消息")
+    lines.append("")
+
+    # ── 利空消息 ──
+    lines.append("**━━━ 🔴 利空消息及标的 ━━━**")
+    if bearish:
+        for idx, (item, stocks) in enumerate(bearish):
+            title = item.get("title", "")[:80]
+            if idx > 0:
+                lines.append("")
+            lines.append(f"**{idx + 1}. {title}**")
+            for stock_name, chain, logic, d, kw in stocks:
+                lines.append(f"  {_color_tag(d)} **{stock_name}**  {chain} · {logic}")
+    else:
+        lines.append("暂无利空消息")
+    lines.append("")
+
+    # ── 中性消息 ──
+    lines.append("**━━━ 🟡 中性 / 待观察 ━━━**")
+    if neutral:
+        for idx, (item, stocks) in enumerate(neutral):
+            title = item.get("title", "")[:80]
+            if idx > 0:
+                lines.append("")
+            lines.append(f"**{idx + 1}. {title}**")
+            for stock_name, chain, logic, d, kw in stocks:
+                lines.append(f"  {_color_tag(d)} **{stock_name}**  {chain} · {logic}")
+    else:
+        lines.append("暂无中性消息")
+
+    content = "\n".join(lines)
+
+    # 检查长度，超长则分两半发送
+    test_body = json.dumps({"msg_type": "interactive", "card": {"header": {"title": {"tag": "plain_text", "content": "📰 盘前消息"}, "template": "green"}, "elements": [{"tag": "markdown", "content": content}]}}, ensure_ascii=False).encode("utf-8")
+    if len(test_body) > MAX_BYTES:
+        # 分两半：先发利好+利空前半，再发利空后半+中性
+        # 按总条目数平分
+        total_entries = len(bullish) + len(bearish) + len(neutral)
+        if total_entries == 0:
+            send_card("📰 盘前消息", "暂无消息", "green")
+            return
+
+        # 尝试前半部分：利好 + 利空
+        half_lines = []
+        half_lines.append("**━━━ 🟢 利好消息及标的 ━━━**")
+        if bullish:
+            for idx, (item, stocks) in enumerate(bullish):
+                title = item.get("title", "")[:80]
+                if idx > 0:
+                    half_lines.append("")
+                half_lines.append(f"**{idx + 1}. {title}**")
+                for stock_name, chain, logic, d, kw in stocks:
+                    half_lines.append(f"  {_color_tag(d)} **{stock_name}**  {chain} · {logic}")
+        else:
+            half_lines.append("暂无利好消息")
+
+        half_content = "\n".join(half_lines)
+        send_card(f"📰 盘前消息（上）", half_content, "green")
+        time.sleep(0.3)
+
+        # 后半部分：利空 + 中性
+        half2_lines = []
+        half2_lines.append("**━━━ 🔴 利空消息及标的 ━━━**")
+        if bearish:
+            for idx, (item, stocks) in enumerate(bearish):
+                title = item.get("title", "")[:80]
+                if idx > 0:
+                    half2_lines.append("")
+                half2_lines.append(f"**{idx + 1}. {title}**")
+                for stock_name, chain, logic, d, kw in stocks:
+                    half2_lines.append(f"  {_color_tag(d)} **{stock_name}**  {chain} · {logic}")
+        else:
+            half2_lines.append("暂无利空消息")
+        half2_lines.append("")
+        half2_lines.append("**━━━ 🟡 中性 / 待观察 ━━━**")
+        if neutral:
+            for idx, (item, stocks) in enumerate(neutral):
+                title = item.get("title", "")[:80]
+                if idx > 0:
+                    half2_lines.append("")
+                half2_lines.append(f"**{idx + 1}. {title}**")
+                for stock_name, chain, logic, d, kw in stocks:
+                    half2_lines.append(f"  {_color_tag(d)} **{stock_name}**  {chain} · {logic}")
+        else:
+            half2_lines.append("暂无中性消息")
+
+        half2_content = "\n".join(half2_lines)
+        send_card("📰 盘前消息（下）", half2_content, "green")
+    else:
+        send_card("📰 盘前消息", content, "green")
+
+
+# ── 卡片3: 题材预判（新增） ──
+def card_theme_preview(news_stock_map, us_data):
+    """新增题材预判卡片：消息面热点方向 + 昨日涨停方向 + 连板题材 + 共振判断"""
+    lines = []
+
+    # ── 1. 消息面热点方向 ──
+    lines.append("**━━━ 📡 消息面热点方向 ━━━**")
+    # 从利好消息中提取题材关键词（chain 字段）
+    theme_keywords = {}
+    for item, stocks in news_stock_map:
+        for stock_name, chain, logic, d, kw in stocks:
+            if d == "利好":
+                if chain not in theme_keywords:
+                    theme_keywords[chain] = []
+                theme_keywords[chain].append(stock_name)
+
+    if theme_keywords:
+        # 按股票数量排序，取前 5 个热门题材
+        sorted_themes = sorted(theme_keywords.items(), key=lambda x: -len(x[1]))
+        for chain, stocks in sorted_themes[:5]:
+            stock_str = "、".join(stocks[:3])
+            if len(stocks) > 3:
+                stock_str += f" 等{len(stocks)}只"
+            lines.append(f"  🔥 **{chain}**：{stock_str}")
+    else:
+        lines.append("  暂无明确消息面热点")
+    lines.append("")
+
+    # ── 2. 昨日涨停方向 ──
+    lines.append("**━━━ 📈 昨日涨停行业分布 ━━━**")
+    try:
+        from datetime import datetime, timedelta
+        # 获取最近一个交易日的数据（如果是周一，则取上周五）
+        yesterday = datetime.now() - timedelta(days=1)
+        date_str = yesterday.strftime("%Y%m%d")
+        heat = _theme_heat_safe(date_str)
+        up_industries = heat.get("up_industries", [])
+        if up_industries:
+            for ind, count, stock_list in up_industries[:8]:
+                stock_names = [s.get("name", "") for s in stock_list[:3]]
+                stock_str = "、".join(stock_names)
+                if len(stock_list) > 3:
+                    stock_str += f" 等{count}只"
+                lines.append(f"  📊 **{ind}**（{count}只涨停）：{stock_str}")
+        else:
+            lines.append("  昨日涨停数据暂无")
+    except Exception as e:
+        log(f"涨停行业分布获取失败: {e}")
+        lines.append("  涨停数据获取暂不可用")
+    lines.append("")
+
+    # ── 3. 连板持续题材 ──
+    lines.append("**━━━ 🔗 连板持续题材 ━━━**")
+    try:
+        strong_themes = heat.get("strong_themes", {})
+        if strong_themes:
+            sorted_strong = sorted(strong_themes.items(), key=lambda x: -x[1]["count"])
+            for ind, info in sorted_strong[:5]:
+                stock_names = [s.get("name", "") for s in info["stocks"][:3]]
+                stock_str = "、".join(stock_names)
+                if len(info["stocks"]) > 3:
+                    stock_str += f" 等{info['count']}只"
+                lines.append(f"  🔗 **{ind}**（{info['count']}只连板）：{stock_str}")
+        else:
+            lines.append("  暂无连板题材数据")
+    except Exception as e:
+        log(f"连板题材获取失败: {e}")
+        lines.append("  连板数据获取暂不可用")
+    lines.append("")
+
+    # ── 4. 题材延续性判断 ──
+    lines.append("**━━━ 🎯 题材延续性判断 ━━━**")
+    try:
+        # 消息面题材关键词集合
+        news_themes = set(theme_keywords.keys())
+        # 涨停行业集合
+        limit_up_industries = set(ind for ind, _, _ in up_industries[:8]) if up_industries else set()
+        # 连板题材集合
+        strong_industries = set(strong_themes.keys()) if strong_themes else set()
+
+        # 共振判断：消息面热点与涨停方向/连板题材是否重叠
+        resonance_news_up = news_themes & limit_up_industries  # 消息面 ∩ 涨停
+        resonance_news_strong = news_themes & strong_industries  # 消息面 ∩ 连板
+        resonance_all = news_themes & limit_up_industries & strong_industries  # 三者共振
+
+        if resonance_all:
+            lines.append(f"  ✅ **强共振**：{', '.join(resonance_all)} 消息面+涨停+连板三重共振，题材延续性极强")
+        elif resonance_news_strong:
+            lines.append(f"  🔥 **消息面+连板共振**：{', '.join(resonance_news_strong)} 消息面与连板题材共振，题材有望延续")
+        elif resonance_news_up:
+            lines.append(f"  📊 **消息面+涨停共振**：{', '.join(resonance_news_up)} 消息面与昨日涨停方向共振")
+        else:
+            lines.append("  ⚠️ 消息面热点与昨日涨停/连板方向暂无共振，关注新题材启动")
+
+        # 美股情绪对题材的影响
+        major_indices = [idx for idx in us_data.get("indices", []) if idx["name"] in ("道琼斯", "纳斯达克100", "标普500")]
+        if major_indices:
+            avg_chg = sum(idx["chg_pct"] for idx in major_indices) / len(major_indices)
+            if avg_chg > 0.5:
+                lines.append("  💡 美股科技领涨，关注AI/半导体/消费电子题材映射")
+            elif avg_chg < -0.5:
+                lines.append("  💡 美股科技承压，题材追高需谨慎，关注防御板块（黄金/高股息）")
+    except Exception as e:
+        log(f"题材预判异常: {e}")
+        lines.append("  题材预判暂不可用")
+
+    content = "\n".join(lines)
+    send_card("🎯 题材预判", content, "orange")
+
+
 # ── 主流程 ──
 def main():
     log("=" * 60)
@@ -545,59 +805,53 @@ def main():
     bearish_count = sum(1 for _, _, _, d, _ in all_stocks if d == "利空")
     neutral_count = sum(1 for _, _, _, d, _ in all_stocks if d == "中性")
 
-    news_with_bullish = sum(1 for item, stocks in news_stock_map if any(d == "利好" for _, _, _, d, _ in stocks))
-    news_with_bearish = sum(1 for item, stocks in news_stock_map if any(d == "利空" for _, _, _, d, _ in stocks))
-    news_with_neutral = sum(1 for item, stocks in news_stock_map if any(d == "中性" for _, _, _, d, _ in stocks))
-
     log(f"统计: 利好{bullish_count}标 / 利空{bearish_count}标 / 中性{neutral_count}标")
 
-    # 5. 卡片1: 早盘概览
+    # 5. 卡片1: 隔夜外盘 (blue) — 合并原来的早盘概览 + 美股映射
+    card_overview(us_data, news_items, all_stocks, bullish_count, bearish_count, neutral_count)
+    time.sleep(0.5)
+
+    # 6. 卡片2: 盘前消息 (green) — 合并原来的利好/利空/中性三张卡片
+    card_news(news_stock_map)
+    time.sleep(0.5)
+
+    # 7. 卡片3: 题材预判 (orange) — 新增
+    card_theme_preview(news_stock_map, us_data)
+    time.sleep(0.5)
+
+    # 8. 卡片4: 早盘研判 (purple)
+    # 美股情绪判断
     major_indices = [idx for idx in us_data.get("indices", []) if idx["name"] in ("道琼斯", "纳斯达克100", "标普500")]
     if major_indices:
         avg_chg = sum(idx["chg_pct"] for idx in major_indices) / len(major_indices)
         if avg_chg > 0.3:
-            us_verdict = "美股隔夜全面收涨，情绪偏暖，利好A股开盘"
+            us_verdict = "美股隔夜收涨，情绪偏暖"
         elif avg_chg < -0.3:
-            us_verdict = "美股隔夜全面收跌，情绪偏冷，A股开盘承压"
+            us_verdict = "美股隔夜收跌，情绪偏冷"
         else:
-            us_verdict = "美股隔夜窄幅震荡，情绪中性，A股开盘震荡"
+            us_verdict = "美股隔夜窄幅震荡，情绪中性"
     elif us_data.get("is_closed"):
-        us_verdict = "美股周末休市，关注上周五收盘数据"
+        us_verdict = "美股周末休市"
     else:
-        us_verdict = "美股行情数据获取中..."
+        us_verdict = "美股数据待获取"
 
-    weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-    wd = weekdays[today.weekday()]
-    date_display = today.strftime("%Y年%m月%d日") + f" {wd}"
+    # 提取题材方向提示
+    theme_direction = ""
+    try:
+        theme_keywords = {}
+        for item, stocks in news_stock_map:
+            for stock_name, chain, logic, d, kw in stocks:
+                if d == "利好":
+                    if chain not in theme_keywords:
+                        theme_keywords[chain] = 0
+                    theme_keywords[chain] += 1
+        if theme_keywords:
+            top_themes = sorted(theme_keywords.items(), key=lambda x: -x[1])[:3]
+            theme_direction = "、".join(f"{t}({c}只)" for t, c in top_themes)
+            theme_direction = f"消息面热点题材：{theme_direction}\n\n"
+    except:
+        pass
 
-    overview = f"""**{date_display} 早盘简报**
-
-{us_verdict}
-
-盘前消息：{len(news_items)} 条 | 关联标的：{len(set(s for s, _, _, _, _ in all_stocks))} 只
-
-<font color='green'>▸ 利好：{news_with_bullish} 条消息 | {bullish_count} 只标的</font>
-<font color='red'>▸ 利空：{news_with_bearish} 条消息 | {bearish_count} 只标的</font>
-<font color='orange'>▸ 中性/待观察：{news_with_neutral} 条消息 | {neutral_count} 只标的</font>
-
-数据来源：金十数据 | 东财快讯 | 新浪全球宏观 | 自动化生成"""
-    send_card("📊 早盘概览", overview, "blue")
-    time.sleep(0.5)
-
-    # 6. 卡片2: 美股映射
-    us_mapping = build_us_mapping(us_data)
-    send_card("🇺🇸 美股隔夜 → A股映射", us_mapping, "blue")
-    time.sleep(0.5)
-
-    # 7. 卡片3-5: 方向
-    build_direction_cards(news_stock_map, "利好", "green")
-    time.sleep(0.5)
-    build_direction_cards(news_stock_map, "利空", "red")
-    time.sleep(0.5)
-    build_direction_cards(news_stock_map, "中性", "orange")
-    time.sleep(0.5)
-
-    # 8. 卡片6: 研判
     judgment = f"""**今日关注要点：**
 
 **外围：**
@@ -611,8 +865,9 @@ def main():
 • 北向资金动向
 • 昨日涨停板晋级情况
 
-**风格判断：**
-▸ 美股情绪传导：A股开盘30分钟跟随美股方向
+**{theme_direction}风格判断：**
+▸ 美股情绪传导：{us_verdict}
+▸ A股开盘30分钟跟随美股方向
 ▸ 消息面主导：利好/利空方向决定日内板块轮动
 ▸ 关注开盘后资金流向确认
 
