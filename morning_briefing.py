@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-每日早盘简报自动化 (8:40)
+morning_briefing.py - 每日早盘简报自动化 (8:40) · v3
 - 交易日早上 8:40 执行
 - 收集美股隔夜行情 + 盘前消息面
 - 消息面利好/利空/中性映射到 A 股标的
 - 发送 4 张飞书分卡片：隔夜外盘 / 盘前消息 / 题材预判 / 早盘研判
 """
 
-import os
 import sys
 import json
 import re
@@ -59,17 +58,6 @@ def _color_tag(direction):
     color_map = {"利好": "red", "利空": "green", "中性": "orange"}
     arrow_map = {"利好": "🔴", "利空": "🟢", "中性": "🟡"}
     return f"<font color='{color_map[direction]}'>{arrow_map[direction]} {direction}</font>"
-
-# ── 交易日判断（uzi_common 已支持 akshare fallback） ──
-def is_trading_day_local(date_str):
-    """date_str 格式 YYYYMMDD"""
-    try:
-        from datetime import datetime as _dt
-        dt = _dt.strptime(date_str, "%Y%m%d")
-        return is_trading_day(dt)
-    except Exception as e:
-        log(f"交易日判断失败: {e}")
-        return True
 
 # ── 美股隔夜行情（腾讯 qt 三市场）──
 def get_us_overnight():

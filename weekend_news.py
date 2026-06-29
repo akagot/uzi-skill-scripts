@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-周末/假期消息面汇总自动化 (22:00)
+weekend_news.py - 周末/假期消息面汇总自动化 (22:00) · v3
 - 每天晚上 22:00 执行
 - 当 昨天非交易日 且 明天是交易日 时触发
 - 收集周末/假期消息面
@@ -8,7 +8,6 @@
 - 发送飞书 4 卡片：本周复盘 → 周末消息 → 题材预判 → 下周策略
 """
 
-import os
 import sys
 import json
 import re
@@ -30,48 +29,10 @@ FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/96d30f0a-639b-40c
 MAX_BYTES = 18000
 log = make_logger(LOG_FILE)
 
-# ── 工具函数 ──
-def log(msg):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] {msg}"
-    print(line)
-    try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except:
-        pass
-
 # ── 飞书卡片（转发到 uzi_common） ──
 def send_card(title, content, template="blue"):
     """包装 uzi_common.send_feishu_card"""
     return send_feishu_card(FEISHU_WEBHOOK, title, content, template, MAX_BYTES, log=log)
-
-def send_text(title, content):
-    try:
-        payload = {"msg_type": "text", "content": {"text": f"{title}\n\n{content}"}}
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(FEISHU_WEBHOOK, data=body, headers={"Content-Type": "application/json"})
-        resp = urllib.request.urlopen(req, timeout=30)
-        log(f"飞书文本推送成功: {resp.read().decode()}")
-    except Exception as e:
-        log(f"飞书文本推送失败: {e}")
-
-# ── 交易日判断（uzi_common 已支持 akshare fallback） ──
-def is_trading_day_local(date_str):
-    """date_str 格式 YYYYMMDD"""
-    try:
-        from datetime import datetime as _dt
-        dt = _dt.strptime(date_str, "%Y%m%d")
-        return is_trading_day(dt)
-    except Exception as e:
-        log(f"交易日判断失败: {e}")
-        # 周末直接返回 False
-        from datetime import datetime as _dt
-        try:
-            d = _dt.strptime(date_str, "%Y%m%d")
-            return d.weekday() < 5
-        except:
-            return True
 
 # ── 消息面收集（使用 uzi_common 带重试的 HTTP 客户端） ──
 def _fetch_json(url, headers=None, timeout=15):

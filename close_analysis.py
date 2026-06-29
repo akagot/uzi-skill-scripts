@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
 """
-收盘复盘+尾盘抢筹自动化 (15:01) · v3
+close_analysis.py - 收盘复盘+尾盘抢筹自动化 (15:01) · v3
 - 交易日 15:01 执行
 - 4 卡片：收盘概览 / 题材资金 / 热门标的 / 明日策略
-- 数据源：新浪行业板块 + akshare 涨停池/连板池 + 腾讯 qt
+- 数据源：腾讯 qt 指数 + 同花顺热点/涨停揭秘 + akshare 涨停池/连板池
 """
 
-import os
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
+# ── 共享工具 ──
 sys.path.insert(0, str(Path(__file__).parent))
 from uzi_common import (
-    _index_quotes, _sector_spot_sina, _theme_heat_safe,
+    _index_quotes, _theme_heat_safe,
     _fetch_limit_pool_safe, _fetch_dt_pool_safe, _fetch_strong_pool_ak,
     _a_share_active_stocks,
-    send_feishu_card, color_chg, fmt_price, fmt_amount_yi, is_trading_day, make_logger,
+    send_feishu_card, color_chg, fmt_price, is_trading_day, make_logger,
 )
 
+# ── 配置 ──
 LOG_FILE = Path("/tmp/uzi_close_analysis.log")
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/96d30f0a-639b-40c8-8ed5-1028ea80bef9"
 log = make_logger(LOG_FILE)

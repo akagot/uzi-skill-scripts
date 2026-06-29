@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
 """
-早盘竞价+大盘分析自动化 (9:26) · v3
+morning_analysis.py - 早盘竞价+大盘分析自动化 (9:26) · v3
 - 交易日 9:26 执行
 - 4 卡片：竞价概览 / 题材热度 / 竞价异动 / 早盘研判
-- 数据源：新浪行业板块 + 腾讯 qt + akshare 涨停池/连板池
+- 数据源：腾讯 qt 指数/美股指数 + 同花顺热点/涨停揭秘 + akshare 涨停池/连板池
 """
 
-import os
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
+# ── 共享工具 ──
 sys.path.insert(0, str(Path(__file__).parent))
 from uzi_common import (
-    _index_quotes, _sector_spot_sina, _a_share_active_stocks,
-    _us_sector_etf_quotes, _theme_heat_safe,
+    _index_quotes, _a_share_active_stocks,
+    _theme_heat_safe,
     send_feishu_card, color_chg, fmt_price, is_trading_day, make_logger,
-    US_TECH_LEADERS, fetch_qt_quotes,
+    fetch_qt_quotes,
 )
 
+# ── 配置 ──
 LOG_FILE = Path("/tmp/uzi_morning_analysis.log")
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/96d30f0a-639b-40c8-8ed5-1028ea80bef9"
 log = make_logger(LOG_FILE)
