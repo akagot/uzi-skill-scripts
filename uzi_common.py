@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 """
-uzi_common.py - 5 个脚本共享的工具函数（v3.0）
-- HTTP 重试客户端（带 UA/Referer + 指数退避）
-- 飞书交互卡片发送（带长度保护与续发）
-- 腾讯 qt.gtimg.cn 批量报价（A/H/U 三市场，HTTP GBK）
-- 交易日判断（akshare 兜底）
-- 涨跌幅颜色/格式工具
-- akshare 涨停池/跌停池/连板池（含代理池回退）
-- 新浪行业板块（akhare stock_sector_spot 49 个行业）
-- 同花顺热点/涨停揭秘/人气榜（题材归因与封板质量增强源）
-- A 股指数/行业 ETF/美股板块 ETF 行情
-- 题材热度聚合（涨停池/跌停池/连板池 + 同花顺概念题材）
+uzi_common.py - 5 个脚本共享的工具函数（v2.0）
+- HTTP 重试客户端
+- 腾讯 qt.gtimg.cn 批量报价（A/H/U 三市场）
+- 新浪 hq.sinajs.cn 批量报价（A/H/U 三市场）
+- 上交所 yunhq.sse.com.cn:32041 单股快照
+- 交易日判断（akshare 可选）
+- 飞书卡片发送
 
-数据源设计参考：
-- UZI-Skill lib/providers/direct_http_provider.py v2.10.3
-- a-stock-data SKILL §3.1 §3.7 §5.3 §8.1 §8.2 §10.2
-- 优先用通达信/腾讯（不封 IP），东财仅用于其独有数据
+数据源设计参考 UZI-Skill lib/providers/direct_http_provider.py v2.10.3
+- akshare 缺失时用 etnet/新浪/etnet 兜底
+- 腾讯 qt 国内稳定，国内外都通
 """
 
 import json
@@ -25,22 +20,19 @@ import urllib.error
 import socket
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # ═══════════════════════════════════════════════════════════════
 # HTTP 客户端（带重试 + User-Agent）
 # ═══════════════════════════════════════════════════════════════
-# 浏览器级 UA，降低被 WAF 拦截的概率
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json,text/plain,*/*",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 
-# ── 底层 GET：bytes / text / json 三种返回封装 ──
 def _http_get_bytes(url, timeout=15, retries=3, extra_headers=None):
-    """HTTP GET → bytes。失败返回 None。指数退避：0.6/1.2/2.4s"""
     headers = dict(DEFAULT_HEADERS)
     if extra_headers:
         headers.update(extra_headers)
@@ -61,9 +53,7 @@ def _http_get_bytes(url, timeout=15, retries=3, extra_headers=None):
     print(f"[HTTP FAIL] {url[:80]}: {last_err}", file=sys.stderr)
     return None
 
-
 def _http_get_text(url, timeout=15, retries=3, encoding="utf-8", extra_headers=None):
-    """HTTP GET → text。按 [encoding, gbk, utf-8] 顺序尝试解码"""
     raw = _http_get_bytes(url, timeout=timeout, retries=retries, extra_headers=extra_headers)
     if raw is None:
         return None
@@ -74,9 +64,7 @@ def _http_get_text(url, timeout=15, retries=3, encoding="utf-8", extra_headers=N
             continue
     return raw.decode("utf-8", errors="replace")
 
-
 def _http_get_json(url, timeout=15, retries=3, extra_headers=None):
-    """HTTP GET → dict。失败返回 None"""
     text = _http_get_text(url, timeout=timeout, retries=retries, extra_headers=extra_headers)
     if text is None:
         return None
@@ -86,12 +74,10 @@ def _http_get_json(url, timeout=15, retries=3, extra_headers=None):
         print(f"[JSON FAIL] {url[:80]}: {e}", file=sys.stderr)
         return None
 
-
 # ═══════════════════════════════════════════════════════════════
-# 飞书推送（交互卡片 + 长度保护）
+# 飞书推送
 # ═══════════════════════════════════════════════════════════════
 def send_feishu_card(webhook, title, content, template="blue", max_bytes=18000, log=None):
-    """发送飞书交互卡片。超长时按 0.9 比例逐次截断到限制内，失败时通过 log 回调记录。"""
     try:
         def make_body(text):
             return json.dumps({
@@ -104,13 +90,11 @@ def send_feishu_card(webhook, title, content, template="blue", max_bytes=18000, 
 
         body = make_body(content[:max_bytes])
         if len(body) > max_bytes:
-            # 内容过长：按 0.9 比例递归截断，确保最终 body < max_bytes
             text = content
             while len(make_body(text)) > max_bytes and len(text) > 100:
                 text = text[:int(len(text) * 0.9)] + "\n\n(内容过长，已截断)"
             body = make_body(text)
 
-        # 2 次重试（首次失败 sleep 1s 后重试）
         for attempt in range(2):
             try:
                 req = urllib.request.Request(
@@ -141,13 +125,12 @@ def send_feishu_card(webhook, title, content, template="blue", max_bytes=18000, 
             print(f"[FEISHU ERR] {title}: {e}", file=sys.stderr)
         return False
 
-
 # ═══════════════════════════════════════════════════════════════
 # 腾讯 qt.gtimg.cn · 实时报价（A/H/U 三市场）
-# 字段索引参考 UZI-Skill direct_http_provider.py（实测校准）
+# 参考 UZI-Skill direct_http_provider.py
 # ═══════════════════════════════════════════════════════════════
 def _qt_code_for(code, market):
-    """把统一代码转成腾讯 qt 格式：sh6xxxxx/sz0xxxxx/hk00700/usAAPL"""
+    """把统一代码转成腾讯 qt 格式"""
     code = str(code).strip()
     if market == "A":
         if code.startswith(("6", "9", "5", "1")):
@@ -156,14 +139,15 @@ def _qt_code_for(code, market):
     elif market == "H":
         return f"hk{code.zfill(5)}"
     elif market == "U":
-        # 腾讯美股：usAAPL（不带交易所后缀），自动加交易所后缀
+        # 腾讯美股：usAAPL（不带后缀）· 腾讯自动加交易所后缀
         code_upper = code.upper().replace(".OQ", "").replace(".N", "").replace(".O", "")
         return f"us{code_upper}"
     return code
 
-
 def _parse_qt_line(line):
-    """解析单行 v_xxx='1~name~code~...'，返回标准 dict；字段名见函数体内注释。"""
+    """解析单行 v_xxx='1~name~code~...'
+    返回 dict: {name, code, price, prev_close, open, change, change_pct, high, low, volume, amount, market}
+    """
     m = re.search(r'v_(\w+)="([^"]+)"', line)
     if not m:
         return None
@@ -172,7 +156,7 @@ def _parse_qt_line(line):
     if len(parts) < 6:
         return None
     try:
-        # 前缀判定市场
+        # 判断市场
         if full.startswith("us"):
             market = "U"
         elif full.startswith("hk"):
@@ -188,26 +172,27 @@ def _parse_qt_line(line):
             "prev_close": float(parts[4]) if parts[4] else None,
             "open": float(parts[5]) if parts[5] else None,
         }
-        # A 股字段：6=成交量(手) 31=涨跌额 32=涨跌幅 33=最高 34=最低 37=成交额
+        # A 股字段：第 6=成交量(手) 7=外盘 8=内盘 9=买一 ... 32=涨跌额 33=涨跌幅 38=最高 39=最低
+        # 港股/美股字段略不同，下面做兼容
         if market == "A":
             result.update({
-                "volume": float(parts[6]) if len(parts) > 6 and parts[6] else None,
+                "volume": float(parts[6]) if len(parts) > 6 and parts[6] else None,  # 手
                 "change": float(parts[31]) if len(parts) > 31 and parts[31] else None,
                 "change_pct": float(parts[32]) if len(parts) > 32 and parts[32] else None,
                 "high": float(parts[33]) if len(parts) > 33 and parts[33] else None,
                 "low": float(parts[34]) if len(parts) > 34 and parts[34] else None,
                 "amount": float(parts[37]) if len(parts) > 37 and parts[37] else None,
             })
-        # 港股字段：6=最高 7=最低 9=涨跌额 31=涨跌幅
         elif market == "H":
+            # 港股字段: 0=市场 1=名字 2=代码 3=现价 4=昨收 5=今开 6=最高 7=最低 9=涨跌额 31=涨跌幅 ...
             result.update({
                 "high": float(parts[6]) if len(parts) > 6 and parts[6] else None,
                 "low": float(parts[7]) if len(parts) > 7 and parts[7] else None,
                 "change": float(parts[9]) if len(parts) > 9 and parts[9] else None,
                 "change_pct": float(parts[31]) if len(parts) > 31 and parts[31] else None,
             })
-        # 美股字段：30=时间 31=涨跌额 32=涨跌幅 33=最高 34=最低
-        else:
+        else:  # U
+            # 美股字段: 0=市场 1=名字 2=代码 3=现价 4=昨收 5=今开 6=成交量 ... 30=时间 31=涨跌额 32=涨跌幅 33=最高 34=最低
             result.update({
                 "change": float(parts[31]) if len(parts) > 31 and parts[31] else None,
                 "change_pct": float(parts[32]) if len(parts) > 32 and parts[32] else None,
@@ -218,13 +203,16 @@ def _parse_qt_line(line):
     except (ValueError, IndexError):
         return None
 
-
 def fetch_qt_quotes(codes_with_markets, timeout=15, retries=2):
-    """批量拉取腾讯实时报价。codes_with_markets: [(code, market), ...]，一次最多 60 个。"""
+    """批量获取腾讯实时报价
+    codes_with_markets: [(code, market), ...]  e.g. [('000001', 'A'), ('AAPL', 'U')]
+    返回 list[dict] · 失败或空缺的不包含
+    """
     if not codes_with_markets:
         return []
     qt_codes = [_qt_code_for(c, m) for c, m in codes_with_markets]
     results = []
+    # 一次最多 60 个
     for i in range(0, len(qt_codes), 60):
         batch = qt_codes[i:i+60]
         url = "https://qt.gtimg.cn/q=" + ",".join(batch)
@@ -237,22 +225,56 @@ def fetch_qt_quotes(codes_with_markets, timeout=15, retries=2):
                 results.append(r)
     return results
 
-
 def fetch_qt_dict(codes_with_markets, **kwargs):
-    """批量拉取并返回 {(code, market): result} 字典。同一 code 多次传入时取最后一次。"""
+    """批量拉取并返回 {code: result} 字典
+    同一 code 多次传入时取最后一次
+    """
     rows = fetch_qt_quotes(codes_with_markets, **kwargs)
     by_code = {}
     for r in rows:
         by_code[(r["code"], r["market"])] = r
     return by_code
 
+# ═══════════════════════════════════════════════════════════════
+# 上交所 yunhq.sse.com.cn:32041 · 单股快照
+# ═══════════════════════════════════════════════════════════════
+def fetch_sse_snap(code, timeout=10, retries=2):
+    """上交所单股快照
+    snap 字段: [名称, 现价, 昨收, 最高, 最低, 开盘, 涨跌额, 涨跌幅, 成交量, 成交额, ...]
+    """
+    url = f"http://yunhq.sse.com.cn:32041/v1/sh1/snap/{code}"
+    text = _http_get_text(url, timeout=timeout, retries=retries, extra_headers={"Referer": "http://yunhq.sse.com.cn/"})
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+        if "snap" not in data or len(data["snap"]) < 10:
+            return None
+        snap = data["snap"]
+        return {
+            "code": code,
+            "name": snap[0],
+            "price": float(snap[1]) if snap[1] else None,
+            "prev_close": float(snap[2]) if snap[2] else None,
+            "high": float(snap[3]) if snap[3] else None,
+            "low": float(snap[4]) if snap[4] else None,
+            "open": float(snap[5]) if snap[5] else None,
+            "change": float(snap[6]) if snap[6] else None,
+            "change_pct": float(snap[7]) if snap[7] else None,
+            "volume": int(float(snap[8])) if snap[8] else None,
+            "amount": float(snap[9]) if snap[9] else None,
+        }
+    except (json.JSONDecodeError, ValueError, IndexError):
+        return None
 
 # ═══════════════════════════════════════════════════════════════
 # 交易日判断
 # ═══════════════════════════════════════════════════════════════
 def is_trading_day(date_obj=None):
-    """判断 date_obj 是否为 A 股交易日。支持 datetime / 'YYYYMMDD' / 'YYYY-MM-DD' / None(=今天)。
-    优先用 akshare 的交易日历，缺失或异常时退回到简单的周末判断。"""
+    """判断 date_obj 是否为 A 股交易日
+    date_obj 可以是 datetime 对象 或 'YYYYMMDD' 字符串 或 None（=今天）
+    优先用 akshare，缺失时退回到简单的周末判断
+    """
     if isinstance(date_obj, str):
         try:
             date_obj = datetime.strptime(date_obj, "%Y%m%d")
@@ -277,31 +299,31 @@ def is_trading_day(date_obj=None):
     except Exception:
         return True
 
-
 # ═══════════════════════════════════════════════════════════════
 # 涨跌幅颜色标签 + 涨跌幅文本
 # ═══════════════════════════════════════════════════════════════
 def color_chg(chg):
-    """涨跌幅转飞书 markdown 颜色标签（红涨绿跌）。None 时显示灰色 --。"""
     if chg is None:
         return "<font color='grey'>--</font>"
     color = "red" if chg >= 0 else "green"
     arrow = "📈" if chg >= 0 else "📉"
     return f"{arrow} <font color='{color}'>{chg:+.2f}%</font>"
 
-
 def fmt_price(price, decimals=2):
-    """价格格式化为千分位字符串。None 时显示 --。"""
     if price is None:
         return "--"
     return f"{price:,.{decimals}f}"
 
+def fmt_amount_yi(amount):
+    """成交额转亿元"""
+    if amount is None:
+        return "--"
+    return f"{amount/1e8:,.1f}亿"
 
 # ═══════════════════════════════════════════════════════════════
 # 日志
 # ═══════════════════════════════════════════════════════════════
 def make_logger(log_file):
-    """生成日志函数：打印 + 追加写入文件（带时间戳）。"""
     def log(msg):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{ts}] {msg}"
@@ -313,11 +335,9 @@ def make_logger(log_file):
             pass
     return log
 
-
 # ═══════════════════════════════════════════════════════════════
-# 标的代码表（按市场分类）
+# 美股/港股代码表（常用 ETF/标的）
 # ═══════════════════════════════════════════════════════════════
-# 美股板块 ETF（18 只）：用于隔夜外盘板块涨跌幅
 US_SECTOR_ETFS = [
     ("QQQ", "纳指100ETF"),
     ("SPY", "标普500ETF"),
@@ -340,7 +360,6 @@ US_SECTOR_ETFS = [
     ("HYG", "高收益债"),
 ]
 
-# 美股科技龙头（14 只）：用于美股 → A 股映射
 US_TECH_LEADERS = [
     ("AAPL", "苹果"), ("MSFT", "微软"), ("GOOGL", "谷歌"),
     ("META", "Meta"), ("AMZN", "亚马逊"), ("NVDA", "英伟达"),
@@ -349,7 +368,14 @@ US_TECH_LEADERS = [
     ("INTC", "英特尔"), ("CSCO", "思科"),
 ]
 
-# A 股大盘指数（7 只）：竞价/午盘/收盘概览
+HK_TECH_LEADERS = [
+    ("00700", "腾讯控股"), ("09988", "阿里巴巴"),
+    ("03690", "美团"), ("01024", "快手"),
+    ("09618", "京东集团"), ("09999", "网易"),
+    ("01810", "小米"), ("02318", "中国平安"),
+    ("00939", "建设银行"), ("01398", "工商银行"),
+]
+
 A_SHARE_INDICES = [
     ("sh000001", "上证指数"), ("sz399001", "深证成指"),
     ("sz399006", "创业板指"), ("sh000688", "科创50"),
@@ -357,7 +383,6 @@ A_SHARE_INDICES = [
     ("sz399905", "中证500"),
 ]
 
-# A 股行业 ETF（27 只）：板块涨跌幅代理
 A_SHARE_SECTOR_ETFS = [
     # 行业 ETF
     ("512010", "医药ETF"), ("512170", "医疗ETF"),
@@ -377,7 +402,6 @@ A_SHARE_SECTOR_ETFS = [
     ("159949", "创业板50ETF"),
 ]
 
-# A 股大盘蓝筹/权重股（45 只）：涨跌停榜代理池（akshare 不可用时回退用）
 A_SHARE_BLUE_CHIPS = [
     # 大盘蓝筹/权重股（涨跌停榜代理池）
     ("600519", "贵州茅台"), ("601318", "中国平安"),
@@ -406,12 +430,10 @@ A_SHARE_BLUE_CHIPS = [
 ]
 
 
-# ═══════════════════════════════════════════════════════════════
-# 指数与 ETF 行情
-# ═══════════════════════════════════════════════════════════════
 def _index_quotes():
-    """A 股大盘指数 · 直接用 qt 代码，避免 sh000001 被映射到 sz000001"""
+    """A 股大盘指数 · 直接用 qt 代码，不走 _qt_code_for（避免 sh000001 被映射到 sz000001）"""
     qt_codes = [c for c, _ in A_SHARE_INDICES]
+    # 直接拉取 qt 数据，不经过 _qt_code_for 转换
     url = "https://qt.gtimg.cn/q=" + ",".join(qt_codes)
     text = _http_get_text(url, timeout=15, retries=2, encoding="gbk")
     if not text:
@@ -432,7 +454,7 @@ def _index_quotes():
 
 
 def _sector_etf_quotes():
-    """A 股行业 ETF 行情 · 按涨跌幅降序"""
+    """A 股行业 ETF 行情"""
     pairs = [(c, "A") for c, _ in A_SHARE_SECTOR_ETFS]
     qs = fetch_qt_quotes(pairs)
     by_code = {q["code"]: q for q in qs}
@@ -446,137 +468,252 @@ def _sector_etf_quotes():
 
 
 # ═══════════════════════════════════════════════════════════════
-# akshare 涨停池 / 跌停池 / 连板池（真实数据，非代理）
+# 东财涨停板池（打板层 V3.3.0）— 涨停/炸板/跌停/昨日涨停 + 连板天梯
+# 参考 a-stock-data SKILL §8.1 — 直连 HTTP，无需 akshare 依赖
 # ═══════════════════════════════════════════════════════════════
-def _fetch_limit_pool_ak(date_str=None):
-    """涨停池 · akshare.stock_zt_pool_em。失败时返回 None（由 _safe 版本回退到代理池）"""
-    if date_str is None:
-        date_str = datetime.now().strftime("%Y%m%d")
+import random
+import requests as _requests
+
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+# 东财全局节流（a-stock-data 防封规则）
+EM_SESSION = _requests.Session()
+EM_SESSION.headers.update({"User-Agent": UA})
+EM_MIN_INTERVAL = 1.0
+_em_last_call = [0.0]
+
+def em_get(url: str, params: dict = None, headers: dict = None, timeout: int = 15, **kwargs):
+    """东财统一请求入口：自动节流 + 复用 session + 默认 UA。
+    所有 eastmoney.com 接口都应通过它请求，避免高频被封 IP。"""
+    wait = EM_MIN_INTERVAL - (time.time() - _em_last_call[0])
+    if wait > 0:
+        time.sleep(wait + random.uniform(0.1, 0.5))
     try:
-        import akshare as ak
-        df = ak.stock_zt_pool_em(date=date_str)
-        if df is None or len(df) == 0:
-            raise ValueError("涨停池为空")
-        out = []
-        for _, row in df.iterrows():
-            out.append({
-                "code": str(row.get("代码", "")),
-                "name": str(row.get("名称", "")),
-                "chg_pct": float(row.get("涨跌幅", 0)),
-                "price": float(row.get("最新价", 0)),
-                "amount": float(row.get("成交额", 0)),
-                "mcap": float(row.get("流通市值", 0)),
-                "turnover": float(row.get("换手率", 0)),
-                "seal_amount": float(row.get("封板资金", 0)),
-                "seal_time": str(row.get("最后封板时间", "")),
-                "break_count": int(row.get("炸板次数", 0)),
-                "consecutive": int(row.get("连板数", 0)),
-                "industry": str(row.get("所属行业", "")),
-            })
-        return out
-    except Exception as e:
-        print(f"[AK LIMIT] 涨停池不可用: {e}", file=sys.stderr)
-        return None
+        return EM_SESSION.get(url, params=params, headers=headers, timeout=timeout, **kwargs)
+    finally:
+        _em_last_call[0] = time.time()
 
+_ZTB_UT = "7eea3edcaed734bea9cbfc24409ed989"
 
-def _fetch_dt_pool_ak(date_str=None):
-    """跌停池 · akshare.stock_zt_pool_dtgc_em。失败时返回 None"""
-    if date_str is None:
-        date_str = datetime.now().strftime("%Y%m%d")
+def _fmt_zt_time(t) -> str:
+    """涨停板时间整数 → HH:MM:SS（92500 → 09:25:00）。"""
+    s = str(t).zfill(6)
+    return f"{s[0:2]}:{s[2:4]}:{s[4:6]}"
+
+def _em_zt_api(endpoint: str, sort: str, date: str) -> list[dict]:
+    """东财涨停板行情中心通用请求（push2ex，走 em_get 限流）。
+    endpoint: getTopicZTPool / getTopicZBPool / getTopicDTPool / getYesterdayZTPool
+    返回 data.pool 原始列表（data 为 null = 非交易日 / 参数错）。"""
+    url = f"https://push2ex.eastmoney.com/{endpoint}"
+    params = {"ut": _ZTB_UT, "dpt": "wz.ztzt", "Pageindex": 0,
+              "pagesize": 10000, "sort": sort, "date": date}
+    headers = {"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"}
     try:
-        import akshare as ak
-        df = ak.stock_zt_pool_dtgc_em(date=date_str)
-        if df is None or len(df) == 0:
-            raise ValueError("跌停池为空")
-        out = []
-        for _, row in df.iterrows():
-            out.append({
-                "code": str(row.get("代码", "")),
-                "name": str(row.get("名称", "")),
-                "chg_pct": float(row.get("涨跌幅", 0)),
-                "price": float(row.get("最新价", 0)),
-                "amount": float(row.get("成交额", 0)),
-                "mcap": float(row.get("流通市值", 0)),
-                "turnover": float(row.get("换手率", 0)),
-                "seal_amount": float(row.get("封单资金", 0)),
-                "consecutive": int(row.get("连续跌停", 0)),
-                "industry": str(row.get("所属行业", "")),
-            })
-        return out
+        r = em_get(url, params=params, headers=headers, timeout=10)
+        return (r.json().get("data") or {}).get("pool") or []
     except Exception as e:
-        print(f"[AK LIMIT] 跌停池不可用: {e}", file=sys.stderr)
-        return None
+        print(f"[WARN] 涨停板池 {endpoint} 请求失败: {e}", file=sys.stderr)
+        return []
 
+def em_zt_pool(date: str) -> list[dict]:
+    """涨停池（a-stock-data 直连，无需 akshare）。date=YYYYMMDD（交易日）。
+    返回每只: code/name/price/pct/amount/float_cap/turnover/limit_days(连板数)/
+    first_seal/last_seal(封板时间)/seal_fund(封板资金,元)/break_times(炸板次数)/
+    industry/zt_stat(N天M板)"""
+    out = []
+    for p in _em_zt_api("getTopicZTPool", "fbt:asc", date):
+        out.append({"code": p["c"], "name": p["n"], "price": p["p"] / 1000,
+            "pct": round(p["zdp"], 2), "amount": p["amount"], "float_cap": p["ltsz"],
+            "turnover": round(p["hs"], 2), "limit_days": p["lbc"],
+            "first_seal": _fmt_zt_time(p["fbt"]), "last_seal": _fmt_zt_time(p["lbt"]),
+            "seal_fund": p["fund"], "break_times": p["zbc"], "industry": p.get("hybk", ""),
+            "zt_stat": f'{(p.get("zttj") or {}).get("days","?")}天{(p.get("zttj") or {}).get("ct","?")}板'})
+    return out
 
-def _fetch_strong_pool_ak(date_str=None):
-    """连板股 · akshare.stock_zt_pool_strong_em。失败时返回 []"""
-    if date_str is None:
-        date_str = datetime.now().strftime("%Y%m%d")
-    try:
-        import akshare as ak
-        df = ak.stock_zt_pool_strong_em(date=date_str)
-        if df is None or len(df) == 0:
-            return []
-        out = []
-        for _, row in df.iterrows():
-            out.append({
-                "code": str(row.get("代码", "")),
-                "name": str(row.get("名称", "")),
-                "chg_pct": float(row.get("涨跌幅", 0)),
-                "price": float(row.get("最新价", 0)),
-                "limit_price": float(row.get("涨停价", 0)),
-                "amount": float(row.get("成交额", 0)),
-                "mcap": float(row.get("流通市值", 0)),
-                "turnover": float(row.get("换手率", 0)),
-                "zt_stat": str(row.get("涨停统计", "")),
-                "reason": str(row.get("入选理由", "")),
-                "industry": str(row.get("所属行业", "")),
-            })
-        return out
-    except Exception as e:
-        print(f"[AK STRONG] 连板池不可用: {e}", file=sys.stderr)
-        return None
+def em_zb_pool(date: str) -> list[dict]:
+    """炸板池（涨停后开板）。返回 code/name/price/limit_price(涨停价)/pct/turnover/
+    first_seal/break_times/amplitude(振幅)/speed(涨速)/industry/zt_stat"""
+    out = []
+    for p in _em_zt_api("getTopicZBPool", "fbt:asc", date):
+        out.append({"code": p["c"], "name": p["n"], "price": p["p"] / 1000,
+            "limit_price": p["ztp"] / 1000, "pct": round(p["zdp"], 2),
+            "turnover": round(p["hs"], 2), "first_seal": _fmt_zt_time(p["fbt"]),
+            "break_times": p["zbc"], "amplitude": round(p["zf"], 2),
+            "speed": round(p["zs"], 2), "industry": p.get("hybk", ""),
+            "zt_stat": f'{(p.get("zttj") or {}).get("days","?")}天{(p.get("zttj") or {}).get("ct","?")}板'})
+    return out
 
+def em_dt_pool(date: str) -> list[dict]:
+    """跌停池。返回 code/name/price/pct/turnover/pe/seal_fund(封单资金)/last_seal/
+    board_amount(板上成交额)/dt_days(连续跌停)/open_times(开板次数)/industry"""
+    out = []
+    for p in _em_zt_api("getTopicDTPool", "fund:asc", date):
+        out.append({"code": p["c"], "name": p["n"], "price": p["p"] / 1000,
+            "pct": round(p["zdp"], 2), "turnover": round(p["hs"], 2), "pe": p.get("pe"),
+            "seal_fund": p["fund"], "last_seal": _fmt_zt_time(p["lbt"]),
+            "board_amount": p.get("fba"), "dt_days": p.get("days"),
+            "open_times": p.get("oc"), "industry": p.get("hybk", "")})
+    return out
+
+def em_yzt_pool(date: str) -> list[dict]:
+    """昨日涨停池（昨涨停今表现，算晋级率/赚钱效应）。返回 code/name/price/
+    pct(今日涨幅)/turnover/amplitude/speed/y_first_seal(昨封板时间)/
+    y_limit_days(昨连板)/industry/zt_stat"""
+    out = []
+    for p in _em_zt_api("getYesterdayZTPool", "zs:desc", date):
+        out.append({"code": p["c"], "name": p["n"], "price": p["p"] / 1000,
+            "pct": round(p["zdp"], 2), "turnover": round(p["hs"], 2),
+            "amplitude": round(p["zf"], 2), "speed": round(p["zs"], 2),
+            "y_first_seal": _fmt_zt_time(p["yfbt"]), "y_limit_days": p["ylbc"],
+            "industry": p.get("hybk", ""),
+            "zt_stat": f'{(p.get("zttj") or {}).get("days","?")}天{(p.get("zttj") or {}).get("ct","?")}板'})
+    return out
+
+def limit_up_sentiment(date: str) -> dict:
+    """打板情绪温度计：连板梯队 + 炸板率 + 涨跌停对比。
+    返回: {ladder: {板数:家数}, max_height: 最高连板, zt_count: 涨停数, break_rate: 炸板率%}
+    """
+    zt = em_zt_pool(date)
+    zb = em_zb_pool(date)
+    dt = em_dt_pool(date)
+    ladder = {}
+    for s in zt:
+        ld = s.get("limit_days", 1)
+        ladder[ld] = ladder.get(ld, 0) + 1
+    zt_n, zb_n = len(zt), len(zb)
+    return {"date": date, "zt_count": zt_n, "zb_count": zb_n, "dt_count": len(dt),
+        "break_rate": round(zb_n / (zt_n + zb_n) * 100, 1) if (zt_n + zb_n) else 0,
+        "max_height": max((s["limit_days"] for s in zt), default=0),
+        "ladder": dict(sorted(ladder.items()))}
+
+def _convert_em_zt_to_old_format(zt_list):
+    """将东财涨停池转换为旧接口格式（兼容现有代码）"""
+    out = []
+    for p in zt_list:
+        out.append({
+            "code": p["code"],
+            "name": p["name"],
+            "chg_pct": p["pct"],
+            "price": p["price"],
+            "amount": p["amount"],
+            "mcap": p["float_cap"],
+            "turnover": p["turnover"],
+            "seal_amount": p["seal_fund"],
+            "seal_time": p["last_seal"],
+            "break_count": p["break_times"],
+            "consecutive": p["limit_days"],
+            "industry": p["industry"],
+        })
+    return out
+
+def _convert_em_dt_to_old_format(dt_list):
+    """将东财跌停池转换为旧接口格式（兼容现有代码）"""
+    out = []
+    for p in dt_list:
+        out.append({
+            "code": p["code"],
+            "name": p["name"],
+            "chg_pct": p["pct"],
+            "price": p["price"],
+            "amount": p["board_amount"],
+            "mcap": 0,  # 不提供流通市值，旧代码不用
+            "turnover": p["turnover"],
+            "seal_amount": p["seal_fund"],
+            "consecutive": p["dt_days"],
+            "industry": p["industry"],
+        })
+    return out
 
 def _fetch_limit_pool_safe(date_str=None):
-    """涨停池 · akshare 优先，失败回退到活跃股代理（涨幅 ≥ 9.5%）"""
-    ak_result = _fetch_limit_pool_ak(date_str)
-    if ak_result is not None:
-        return ak_result, "akshare"
-    # fallback: 活跃股代理
-    stocks = _a_share_active_stocks()
-    proxy = sorted([s for s in stocks if s.get("change_pct", 0) >= 9.5],
-                   key=lambda x: -(x.get("change_pct") or 0))[:15]
-    return proxy, "proxy"
-
+    """涨停池 · 东财直连（a-stock-data V3.3），无需 akshare
+    返回: (list[dict], source_name)
+    """
+    if date_str is None:
+        date_str = datetime.now().strftime("%Y%m%d")
+    try:
+        em_result = em_zt_pool(date_str)
+        if em_result is not None and len(em_result) > 0:
+            return _convert_em_zt_to_old_format(em_result), "东财直连"
+        raise ValueError("涨停池为空")
+    except Exception as e:
+        print(f"[LIMIT] 东财涨停池不可用: {e}", file=sys.stderr)
+        # fallback: 活跃股代理
+        stocks = _a_share_active_stocks()
+        proxy = sorted([s for s in stocks if s.get("change_pct", 0) >= 9.5],
+                       key=lambda x: -(x.get("change_pct") or 0))[:15]
+        return proxy, "proxy"
 
 def _fetch_dt_pool_safe(date_str=None):
-    """跌停池 · akshare 优先，失败回退到活跃股代理（跌幅 ≤ -9.5%）"""
-    ak_result = _fetch_dt_pool_ak(date_str)
-    if ak_result is not None:
-        return ak_result, "akshare"
-    stocks = _a_share_active_stocks()
-    proxy = sorted([s for s in stocks if s.get("change_pct", 0) <= -9.5],
-                   key=lambda x: (x.get("change_pct") or 0))[:15]
-    return proxy, "proxy"
+    """跌停池 · 东财直连（a-stock-data V3.3），无需 akshare
+    返回: (list[dict], source_name)
+    """
+    if date_str is None:
+        date_str = datetime.now().strftime("%Y%m%d")
+    try:
+        em_result = em_dt_pool(date_str)
+        if em_result is not None and len(em_result) > 0:
+            return _convert_em_dt_to_old_format(em_result), "东财直连"
+        raise ValueError("跌停池为空")
+    except Exception as e:
+        print(f"[DT] 东财跌停池不可用: {e}", file=sys.stderr)
+        stocks = _a_share_active_stocks()
+        proxy = sorted([s for s in stocks if s.get("change_pct", 0) <= -9.5],
+                       key=lambda x: (x.get("change_pct") or 0))[:15]
+        return proxy, "proxy"
+
+def _fetch_strong_pool_em(date_str=None):
+    """连板股 · 东财直连，从涨停池提取（无需 akshare 强势股）
+    返回: 连板股列表（limit_days >= 2）
+    """
+    if date_str is None:
+        date_str = datetime.now().strftime("%Y%m%d")
+    try:
+        all_zt = em_zt_pool(date_str)
+        # 连板股 = 连板数 >= 2 的涨停股
+        strong = [p for p in all_zt if p.get("limit_days", 1) >= 2]
+        # 转换为旧格式
+        out = []
+        for p in strong:
+            out.append({
+                "code": p["code"],
+                "name": p["name"],
+                "chg_pct": p["pct"],
+                "price": p["price"],
+                "amount": p["amount"],
+                "mcap": p["float_cap"],
+                "turnover": p["turnover"],
+                "zt_stat": p["zt_stat"],
+                "reason": "",
+                "industry": p["industry"],
+            })
+        return out
+    except Exception as e:
+        print(f"[STRONG] 东财连板池不可用: {e}", file=sys.stderr)
+        return None
 
 
 def _a_share_active_stocks():
-    """A 股活跃股权重股 · 涨跌停榜代理池（45 只蓝筹）"""
+    """A 股活跃股权重股（涨跌停榜代理池）"""
     pairs = [(c, "A") for c, _ in A_SHARE_BLUE_CHIPS]
     qs = fetch_qt_quotes(pairs)
     valid = [q for q in qs if q.get("change_pct") is not None]
     return valid
 
 
+def _us_quote(code):
+    """单只美股"""
+    qs = fetch_qt_quotes([(code, "U")])
+    return qs[0] if qs else None
+
+
 def _us_quotes_batch(codes):
-    """批量美股报价 · 给一组纯 code 列表（市场为 U）"""
+    """批量美股"""
     pairs = [(c, "U") for c in codes]
     return fetch_qt_quotes(pairs)
 
 
 def _us_sector_etf_quotes():
-    """美股板块 ETF 行情 · 按涨跌幅降序"""
+    """美股板块 ETF 行情"""
     pairs = [(c, "U") for c, _ in US_SECTOR_ETFS]
     qs = fetch_qt_quotes(pairs)
     by_code = {q["code"]: q for q in qs}
@@ -593,8 +730,9 @@ def _us_sector_etf_quotes():
 # 新浪行业板块 · 49 个真实行业涨跌（替代 ETF 代理）
 # ═══════════════════════════════════════════════════════════════
 def _sector_spot_sina():
-    """新浪行业板块（akshare 代理） · 返回 49 个行业真实涨跌数据。
-    字段: name, chg_pct, count(公司家数), lead_stock, lead_code, lead_chg, amount。失败返回 None。"""
+    """新浪行业板块 · 返回 49 个行业真实涨跌数据
+    字段: name, chg_pct, count(公司家数), lead_stock, lead_code, lead_chg, amount
+    """
     try:
         import akshare as ak
         df = ak.stock_sector_spot(indicator="新浪行业")
@@ -624,7 +762,7 @@ def _sector_spot_sina():
 # ═══════════════════════════════════════════════════════════════
 def _eastmoney_global_news(page_size=30):
     """东方财富全球财经资讯（7x24 滚动）。
-    返回: [{title, summary, time}]。失败返回 None。
+    返回: [{title, summary, time}]
     """
     import uuid
     url = "https://np-weblist.eastmoney.com/comm/web/getFastNewsList"
@@ -778,7 +916,7 @@ def _ths_concept_heat(date_str=None):
     stocks = _ths_hot_reason(date_str)
     if stocks is None:
         return None
-    # 提取所有题材标签（按 '+' 拆分）
+    # 提取所有题材标签
     tag_buckets = {}
     for s in stocks:
         reason = s.get("reason", "")
@@ -850,14 +988,13 @@ def _theme_heat_from_pools(limit_up, limit_down, strong_pool):
 
 
 def _theme_heat_safe(date_str=None):
-    """安全获取题材热度 · 同花顺概念题材(主) + 涨停池(辅) + 连板池 + 人气榜 + 涨停揭秘
-    一次性聚合多个数据源，方便业务脚本一次性获取所有题材相关信号。"""
+    """安全获取题材热度 · 同花顺概念题材(主) + 涨停池(辅) + 连板池 + 人气榜 + 涨停揭秘"""
     if date_str is None:
         date_str = datetime.now().strftime("%Y%m%d")
     date_dash = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
     up, up_src = _fetch_limit_pool_safe(date_str)
     down, down_src = _fetch_dt_pool_safe(date_str)
-    strong = _fetch_strong_pool_ak(date_str)
+    strong = _fetch_strong_pool_em(date_str)
     heat = _theme_heat_from_pools(up, down, strong)
     heat["up_src"] = up_src
     heat["down_src"] = down_src
@@ -898,3 +1035,45 @@ def _theme_heat_safe(date_str=None):
     else:
         heat["hot_rank"] = None
     return heat
+
+
+# ═══════════════════════════════════════════════════════════════
+# a-stock-data SKILL.md 自动拉取（每次启动时拉取最新版本）
+# ═══════════════════════════════════════════════════════════════
+_SKILL_CACHE = None
+_SKILL_CACHE_PATH = Path("/tmp/uzi_a_stock_skill.md")
+
+def fetch_latest_skill():
+    """从 GitHub 拉取最新 a-stock-data SKILL.md，缓存到本地。
+    每次自动化启动时调用，确保使用最新版本的数据端点。
+    返回: SKILL.md 文本内容（str），失败返回 None
+    """
+    global _SKILL_CACHE
+    SKILL_URL = "https://raw.githubusercontent.com/simonlin1212/a-stock-data/main/SKILL.md"
+    # 优先用缓存（24小时内有效）
+    if _SKILL_CACHE_PATH.exists():
+        age = time.time() - _SKILL_CACHE_PATH.stat().st_mtime
+        if age < 86400:  # 24小时
+            try:
+                _SKILL_CACHE = _SKILL_CACHE_PATH.read_text(encoding="utf-8")
+                return _SKILL_CACHE
+            except Exception:
+                pass
+    try:
+        text = _http_get_text(SKILL_URL, timeout=15, retries=2, encoding="utf-8")
+        if text and len(text) > 10000:
+            _SKILL_CACHE = text
+            _SKILL_CACHE_PATH.write_text(text, encoding="utf-8")
+            print(f"[SKILL] a-stock-data SKILL.md 已更新 ({len(text)} 字节)", file=sys.stderr)
+            return text
+    except Exception as e:
+        print(f"[SKILL] 拉取 SKILL.md 失败: {e}，使用缓存", file=sys.stderr)
+        if _SKILL_CACHE:
+            return _SKILL_CACHE
+        if _SKILL_CACHE_PATH.exists():
+            try:
+                _SKILL_CACHE = _SKILL_CACHE_PATH.read_text(encoding="utf-8")
+                return _SKILL_CACHE
+            except Exception:
+                pass
+    return None

@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """
-morning_analysis.py - 早盘竞价+大盘分析自动化 (9:26) · v3
+早盘竞价+大盘分析自动化 (9:26) · v3
 - 交易日 9:26 执行
 - 4 卡片：竞价概览 / 题材热度 / 竞价异动 / 早盘研判
-- 数据源：腾讯 qt 指数/美股指数 + 同花顺热点/涨停揭秘 + akshare 涨停池/连板池
+- 数据源：新浪行业板块 + 腾讯 qt + akshare 涨停池/连板池
 """
 
+import os
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
-# ── 共享工具 ──
 sys.path.insert(0, str(Path(__file__).parent))
 from uzi_common import (
-    _index_quotes, _a_share_active_stocks,
-    _theme_heat_safe,
+    _index_quotes, _sector_spot_sina, _a_share_active_stocks,
+    _us_sector_etf_quotes, _theme_heat_safe,
     send_feishu_card, color_chg, fmt_price, is_trading_day, make_logger,
-    fetch_qt_quotes,
+    fetch_latest_skill,
+    US_TECH_LEADERS, fetch_qt_quotes,
 )
 
-# ── 配置 ──
 LOG_FILE = Path("/tmp/uzi_morning_analysis.log")
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/96d30f0a-639b-40c8-8ed5-1028ea80bef9"
 log = make_logger(LOG_FILE)
@@ -54,18 +54,23 @@ def get_auction_stocks():
 def card_overview(indices, us_idx_map):
     lines = ["**📊 竞价·大盘指数**\n"]
     if indices:
+        lines.append("| 指数 | 点位 | 涨跌幅 |")
+        lines.append("|------|------|--------|")
         for idx in indices:
-            lines.append(f"• **{idx['name']}** {fmt_price(idx.get('price'))}  {color_chg(idx.get('chg_pct'))}")
+            lines.append(f"| **{idx['name']}** | {fmt_price(idx.get('price'))} | {color_chg(idx.get('chg_pct'))} |")
     else:
         lines.append("<font color='orange'>⚠️ 指数数据获取失败</font>")
 
     lines.append("\n**🇺🇸 隔夜美股**")
+    lines.append("| 名称 | 代码 | 现价 | 涨跌幅 |")
+    lines.append("|------|------|------|--------|")
     for code, name in [("DJI", "道指"), ("SPX", "标普500"), ("NDX", "纳指100")]:
         q = us_idx_map.get(code)
         if q and q.get("change_pct") is not None:
-            lines.append(f"• {name}  {color_chg(q.get('change_pct'))}")
+            price_str = fmt_price(q.get('price')) if q.get('price') is not None else "-"
+            lines.append(f"| {name} | {code} | {price_str} | {color_chg(q.get('change_pct'))} |")
         else:
-            lines.append(f"• {name}  <font color='grey'>--</font>")
+            lines.append(f"| {name} | {code} | - | <font color='grey'>--</font> |")
 
     lines.append("\n---")
     lines.append("<font color='grey'>数据：新浪行业 · 腾讯 qt  |  仅供参考</font>")
@@ -79,9 +84,11 @@ def card_theme_heat(heat):
     concepts = heat.get("concepts")
     if concepts:
         lines.append("**📊 题材热度排名**（同花顺强势股归因）")
+        lines.append("| 概念 | 只数 | 领涨股 |")
+        lines.append("|------|------|--------|")
         for tag, cnt, stocks in concepts[:10]:
             top_names = "、".join(s["name"] for s in stocks[:3])
-            lines.append(f"• **{tag}**：{cnt} 只 （{top_names}）")
+            lines.append(f"| **{tag}** | {cnt} | {top_names} |")
     else:
         lines.append("<font color='orange'>⚠️ 同花顺热点数据不可用</font>")
 
@@ -90,29 +97,38 @@ def card_theme_heat(heat):
     if strong:
         top_strong = sorted(strong.items(), key=lambda x: -x[1]["count"])[:4]
         lines.append("\n**🔗 连板题材**（持续热点）")
+        lines.append("| 题材 | 只数 | 领涨股 |")
+        lines.append("|------|------|--------|")
         for ind, info in top_strong:
             top_names = "、".join(s["name"] for s in info["stocks"][:3])
-            lines.append(f"• {ind}：{info['count']} 只 （{top_names}）")
+            lines.append(f"| {ind} | {info['count']} | {top_names} |")
 
     # 涨停行业分布（昨日，辅助参考）
     up_ind = heat.get("up_industries", [])
     if up_ind:
         lines.append("\n**涨停行业分布**（昨日，参考）")
+        lines.append("| 行业 | 只数 | 领涨股 |")
+        lines.append("|------|------|--------|")
         for ind, cnt, stocks in up_ind[:4]:
             top_names = "、".join(s["name"] for s in stocks[:2])
-            lines.append(f"• {ind}：{cnt} 只 （{top_names}）")
+            lines.append(f"| {ind} | {cnt} | {top_names} |")
 
     # 人气榜
     hot_rank = heat.get("hot_rank")
     if hot_rank:
         lines.append("\n**🔥 人气榜 TOP5**")
+        lines.append("| 排名 | 名称 | 涨跌幅 | 概念 |")
+        lines.append("|------|------|--------|------|")
         for s in hot_rank[:5]:
             tags = "、".join(s.get("concepts", [])[:2])
             pop = s.get("pop_tag", "")
-            extra = f" · {pop}" if pop else ""
+            concept_parts = []
+            if pop:
+                concept_parts.append(pop)
             if tags:
-                extra += f" · [{tags}]"
-            lines.append(f"• #{s['rank']} {s['name']} {s['pct']}%{extra}")
+                concept_parts.append(f"[{tags}]")
+            concept_str = " · ".join(concept_parts) if concept_parts else "-"
+            lines.append(f"| #{s['rank']} | {s['name']} | {s['pct']}% | {concept_str} |")
 
     lines.append("\n---")
     lines.append("<font color='grey'>数据：同花顺热点 · akshare 涨停池  |  仅供参考</font>")
@@ -126,12 +142,18 @@ def card_auction(up, down):
     else:
         if up:
             lines.append("**领涨活跃股** 🔴")
+            lines.append("| 名称 | 代码 | 现价 | 涨跌幅 |")
+            lines.append("|------|------|------|--------|")
             for s in up:
-                lines.append(f"• {s['name']}({s['code']}) {fmt_price(s.get('price'))}  {color_chg(s.get('change_pct'))}")
+                price_str = fmt_price(s.get('price')) if s.get('price') is not None else "-"
+                lines.append(f"| {s['name']} | {s['code']} | {price_str} | {color_chg(s.get('change_pct'))} |")
         if down:
             lines.append("\n**领跌活跃股** 🟢")
+            lines.append("| 名称 | 代码 | 现价 | 涨跌幅 |")
+            lines.append("|------|------|------|--------|")
             for s in down:
-                lines.append(f"• {s['name']}({s['code']}) {fmt_price(s.get('price'))}  {color_chg(s.get('change_pct'))}")
+                price_str = fmt_price(s.get('price')) if s.get('price') is not None else "-"
+                lines.append(f"| {s['name']} | {s['code']} | {price_str} | {color_chg(s.get('change_pct'))} |")
     lines.append("\n---")
     lines.append("<font color='grey'>45 只活跃股权重股代理  |  数据：腾讯</font>")
     send_feishu_card(FEISHU_WEBHOOK, "⚡ 竞价异动", "\n".join(lines), "green", log=log)
@@ -189,7 +211,8 @@ def card_judgment(indices, heat, up, down):
 
 def main():
     log("=" * 60)
-    log("早盘竞价+大盘分析启动 v3")
+    log("早盘竞价+大盘分析启动 v4")
+    fetch_latest_skill()
     if not is_trading_day():
         log("今日非交易日，跳过")
         return

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-weekend_news.py - 周末/假期消息面汇总自动化 (22:00) · v3
+周末/假期消息面汇总自动化 (22:00)
 - 每天晚上 22:00 执行
 - 当 昨天非交易日 且 明天是交易日 时触发
 - 收集周末/假期消息面
@@ -8,6 +8,7 @@ weekend_news.py - 周末/假期消息面汇总自动化 (22:00) · v3
 - 发送飞书 4 卡片：本周复盘 → 周末消息 → 题材预判 → 下周策略
 """
 
+import os
 import sys
 import json
 import re
@@ -21,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from uzi_common import (
     _http_get_text, send_feishu_card, is_trading_day, make_logger,
     _theme_heat_safe, _index_quotes, color_chg, fmt_price,
+    fetch_latest_skill,
 )
 
 # ── 配置 ──
@@ -29,10 +31,48 @@ FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/96d30f0a-639b-40c
 MAX_BYTES = 18000
 log = make_logger(LOG_FILE)
 
+# ── 工具函数 ──
+def log(msg):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except:
+        pass
+
 # ── 飞书卡片（转发到 uzi_common） ──
 def send_card(title, content, template="blue"):
     """包装 uzi_common.send_feishu_card"""
     return send_feishu_card(FEISHU_WEBHOOK, title, content, template, MAX_BYTES, log=log)
+
+def send_text(title, content):
+    try:
+        payload = {"msg_type": "text", "content": {"text": f"{title}\n\n{content}"}}
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(FEISHU_WEBHOOK, data=body, headers={"Content-Type": "application/json"})
+        resp = urllib.request.urlopen(req, timeout=30)
+        log(f"飞书文本推送成功: {resp.read().decode()}")
+    except Exception as e:
+        log(f"飞书文本推送失败: {e}")
+
+# ── 交易日判断（uzi_common 已支持 akshare fallback） ──
+def is_trading_day_local(date_str):
+    """date_str 格式 YYYYMMDD"""
+    try:
+        from datetime import datetime as _dt
+        dt = _dt.strptime(date_str, "%Y%m%d")
+        return is_trading_day(dt)
+    except Exception as e:
+        log(f"交易日判断失败: {e}")
+        # 周末直接返回 False
+        from datetime import datetime as _dt
+        try:
+            d = _dt.strptime(date_str, "%Y%m%d")
+            return d.weekday() < 5
+        except:
+            return True
 
 # ── 消息面收集（使用 uzi_common 带重试的 HTTP 客户端） ──
 def _fetch_json(url, headers=None, timeout=15):
@@ -242,10 +282,13 @@ def build_direction_cards(news_stock_map, direction, template_color):
         if idx > 0:
             lines.append("")
         lines.append(f"**{idx + 1}. {title}**")
+        lines.append("")
+        lines.append("| 方向 | 标的 | 产业链 | 逻辑 |")
+        lines.append("|------|------|--------|------|")
         for stock_name, chain, logic, d, kw in stocks:
             color = {"利好": "red", "利空": "green", "中性": "orange"}[d]
             arrow = {"利好": "🔴", "利空": "🟢", "中性": "🟡"}[d]
-            lines.append(f"  <font color='{color}'>{arrow} {d}</font> **{stock_name}**  {chain} · {logic}")
+            lines.append(f"| <font color='{color}'>{arrow} {d}</font> | **{stock_name}** | {chain} | {logic} |")
 
     content = "\n".join(lines)
     test_body = json.dumps({"msg_type": "interactive", "card": {"header": {"title": {"tag": "plain_text", "content": section_title}, "template": template_color}, "elements": [{"tag": "markdown", "content": content}]}}, ensure_ascii=False).encode("utf-8")
@@ -321,13 +364,16 @@ def card_weekly_review(last_trade_date_str):
     lines = [
         f"**{date_display} 大盘指数表现**",
         "",
+        "| 指数 | 点位 | 涨跌幅 |",
+        "|------|------|--------|",
     ]
 
     for idx in indices:
         name = idx["name"]
-        price = idx.get("price")
+        price = fmt_price(idx.get("price"))
         chg = idx.get("chg_pct")
-        lines.append(f"• **{name}** {fmt_price(price)}  {color_chg(chg)}")
+        chg_str = color_chg(chg) if chg is not None else "<font color='grey'>--</font>"
+        lines.append(f"| **{name}** | {price} | {chg_str} |")
 
     lines.append("")
     lines.append(f"**市场情绪判断：**")
@@ -367,8 +413,12 @@ def card_news(news_stock_map):
         for idx, (item, stocks) in enumerate(bullish_items):
             title = item.get("title", "")[:80]
             lines.append(f"**{idx + 1}. {title}**")
+            lines.append("")
+            lines.append("| 标的 | 产业链 | 逻辑 |")
+            lines.append("|------|--------|------|")
             for stock_name, chain, logic, d, kw in stocks:
-                lines.append(f"  🔴 <font color='red'>利好</font> **{stock_name}**  {chain} · {logic}")
+                lines.append(f"| **{stock_name}** | {chain} | {logic} |")
+            lines.append("")
     else:
         lines.append("暂无利好消息")
 
@@ -380,8 +430,12 @@ def card_news(news_stock_map):
         for idx, (item, stocks) in enumerate(bearish_items):
             title = item.get("title", "")[:80]
             lines.append(f"**{idx + 1}. {title}**")
+            lines.append("")
+            lines.append("| 标的 | 产业链 | 逻辑 |")
+            lines.append("|------|--------|------|")
             for stock_name, chain, logic, d, kw in stocks:
-                lines.append(f"  🟢 <font color='green'>利空</font> **{stock_name}**  {chain} · {logic}")
+                lines.append(f"| **{stock_name}** | {chain} | {logic} |")
+            lines.append("")
     else:
         lines.append("暂无利空消息")
 
@@ -402,8 +456,12 @@ def card_news(news_stock_map):
             for idx, (item, stocks) in enumerate(bullish_items):
                 title = item.get("title", "")[:80]
                 half1_lines.append(f"**{idx + 1}. {title}**")
+                half1_lines.append("")
+                half1_lines.append("| 标的 | 产业链 | 逻辑 |")
+                half1_lines.append("|------|--------|------|")
                 for stock_name, chain, logic, d, kw in stocks:
-                    half1_lines.append(f"  🔴 <font color='red'>利好</font> **{stock_name}**  {chain} · {logic}")
+                    half1_lines.append(f"| **{stock_name}** | {chain} | {logic} |")
+                half1_lines.append("")
         else:
             half1_lines.append("暂无利好消息")
 
@@ -418,8 +476,12 @@ def card_news(news_stock_map):
             for idx, (item, stocks) in enumerate(bearish_items):
                 title = item.get("title", "")[:80]
                 half2_lines.append(f"**{idx + 1}. {title}**")
+                half2_lines.append("")
+                half2_lines.append("| 标的 | 产业链 | 逻辑 |")
+                half2_lines.append("|------|--------|------|")
                 for stock_name, chain, logic, d, kw in stocks:
-                    half2_lines.append(f"  🟢 <font color='green'>利空</font> **{stock_name}**  {chain} · {logic}")
+                    half2_lines.append(f"| **{stock_name}** | {chain} | {logic} |")
+                half2_lines.append("")
         else:
             half2_lines.append("暂无利空消息")
 
@@ -486,8 +548,10 @@ def card_theme_preview(news_stock_map, last_trade_date_str):
                 mega_topics[mega] = []
             mega_topics[mega].append(kw)
 
+        lines.append("| 题材大类 | 关键词 |")
+        lines.append("|----------|--------|")
         for mega, kws in sorted(mega_topics.items(), key=lambda x: -len(x[1])):
-            lines.append(f"• **{mega}**（{', '.join(kws[:3])}）")
+            lines.append(f"| **{mega}** | {', '.join(kws[:3])} |")
     else:
         lines.append("未识别到明确热点方向")
 
@@ -497,15 +561,19 @@ def card_theme_preview(news_stock_map, last_trade_date_str):
     lines.append("")
     concepts = heat.get("concepts") if heat else None
     if concepts:
+        lines.append("| 题材 | 只数 | 领涨股 |")
+        lines.append("|------|------|--------|")
         for tag, cnt, stocks in concepts[:8]:
             top_names = ", ".join(s["name"] for s in stocks[:3])
-            lines.append(f"• **{tag}** {cnt}只 — {top_names}")
+            lines.append(f"| **{tag}** | {cnt} | {top_names} |")
     else:
         up_industries = heat.get("up_industries", []) if heat else []
         if up_industries:
+            lines.append("| 行业 | 涨停数 | 领涨股 |")
+            lines.append("|------|--------|--------|")
             for ind, cnt, stocks in up_industries[:8]:
                 top_names = ", ".join(s["name"] for s in stocks[:3])
-                lines.append(f"• **{ind}** {cnt}只涨停 — {top_names}")
+                lines.append(f"| **{ind}** | {cnt} | {top_names} |")
         else:
             if heat:
                 lines.append(f"涨停池数据源: {heat.get('up_src', '未知')}，涨停 {heat.get('up_count', 0)} 只")
@@ -518,9 +586,11 @@ def card_theme_preview(news_stock_map, last_trade_date_str):
     lines.append("")
     if strong_themes:
         sorted_themes = sorted(strong_themes.items(), key=lambda x: -x[1]["count"])
+        lines.append("| 题材 | 只数 | 领涨股 |")
+        lines.append("|------|------|--------|")
         for ind, info in sorted_themes[:6]:
             names = ", ".join(s["name"] for s in info["stocks"][:3])
-            lines.append(f"• **{ind}** {info['count']}只连板 — {names}")
+            lines.append(f"| **{ind}** | {info['count']} | {names} |")
     else:
         lines.append("暂无连板持续题材")
 
@@ -686,15 +756,19 @@ def card_next_week_strategy(news_stock_map, last_trade_date_str):
         f"<font color='{sentiment_color}'>{sentiment}</font>",
         f"",
         f"**多空分布：**",
-        f"• 利好消息：{news_with_bullish} 条 → 涉及 {bullish_count} 只标的",
-        f"• 利空消息：{news_with_bearish} 条 → 涉及 {bearish_count} 只标的",
+        f"| 类型 | 消息数 | 标的数 |",
+        f"|------|--------|--------|",
+        f"| <font color='red'>利好</font> | {news_with_bullish} | {bullish_count} |",
+        f"| <font color='green'>利空</font> | {news_with_bearish} | {bearish_count} |",
         "",
         "**下周关注方向**",
     ]
 
     if focus_directions:
+        lines.append("| 方向 | 逻辑 |")
+        lines.append("|------|------|")
         for i, d in enumerate(focus_directions[:6]):
-            lines.append(f"• **{d}** — 消息面驱动，关注龙头表现")
+            lines.append(f"| **{d}** | 消息面驱动，关注龙头表现 |")
     else:
         if bias == "偏多":
             lines.append("• 关注消息面利好板块的补涨机会")
@@ -756,7 +830,8 @@ def _find_last_trading_day(today):
 # ── 主流程 ──
 def main():
     log("=" * 60)
-    log("周末消息面汇总启动")
+    log("周末消息面汇总启动 v4")
+    fetch_latest_skill()
 
     today = datetime.now()
     today_str = today.strftime("%Y%m%d")
