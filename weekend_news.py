@@ -18,7 +18,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 # ── 配置 ──
-WORKSPACE = Path("/workspace")
 LOG_FILE = Path("/tmp/uzi_weekend_news.log")
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/96d30f0a-639b-40c8-8ed5-1028ea80bef9"
 MAX_BYTES = 18000

@@ -17,9 +17,6 @@ from datetime import datetime
 from pathlib import Path
 
 # ── 配置 ──
-WORKSPACE = Path("/workspace")
-UZI_DIR = WORKSPACE  # 兼容旧版 UZI_DIR 引用
-UZI_REPO = "https://github.com/wbh604/UZI-Skill.git"  # 保留以兼容
 LOG_FILE = Path("/tmp/uzi_morning_briefing.log")
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/96d30f0a-639b-40c8-8ed5-1028ea80bef9"
 MAX_BYTES = 18000
