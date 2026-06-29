@@ -282,8 +282,8 @@ def build_direction_cards(news_stock_map, direction, template_color):
             lines.append("")
         lines.append(f"**{idx + 1}. {title}**")
         for stock_name, chain, logic, d, kw in stocks:
-            color = {"利好": "green", "利空": "red", "中性": "orange"}[d]
-            arrow = {"利好": "🟢", "利空": "🔴", "中性": "🟡"}[d]
+            color = {"利好": "red", "利空": "green", "中性": "orange"}[d]
+            arrow = {"利好": "🔴", "利空": "🟢", "中性": "🟡"}[d]
             lines.append(f"  <font color='{color}'>{arrow} {d}</font> **{stock_name}**  {chain} · {logic}")
 
     content = "\n".join(lines)
@@ -304,8 +304,8 @@ def _send_half(items, base_title, template_color, start_num):
             lines.append("")
         lines.append(f"**{start_num + idx}. {title}**")
         for stock_name, chain, logic, d, kw in stocks:
-            color = {"利好": "green", "利空": "red", "中性": "orange"}[d]
-            arrow = {"利好": "🟢", "利空": "🔴", "中性": "🟡"}[d]
+            color = {"利好": "red", "利空": "green", "中性": "orange"}[d]
+            arrow = {"利好": "🔴", "利空": "🟢", "中性": "🟡"}[d]
             lines.append(f"  <font color='{color}'>{arrow} {d}</font> **{stock_name}**  {chain} · {logic}")
     send_card(f"{base_title}（续）", "\n".join(lines), template_color)
 
@@ -343,16 +343,16 @@ def card_weekly_review(last_trade_date_str):
 
     if up_count >= 5:
         sentiment = "市场情绪偏乐观，主要指数普遍上涨"
-        sentiment_color = "green"
+        sentiment_color = "red"
     elif down_count >= 5:
         sentiment = "市场情绪偏谨慎，主要指数普遍下跌"
-        sentiment_color = "red"
+        sentiment_color = "green"
     elif up_count > down_count:
         sentiment = "市场情绪分化，多数指数收涨但仍有分化"
-        sentiment_color = "green"
+        sentiment_color = "red"
     elif down_count > up_count:
         sentiment = "市场情绪偏弱，多数指数收跌"
-        sentiment_color = "red"
+        sentiment_color = "green"
     else:
         sentiment = "市场情绪中性，指数涨跌互现"
         sentiment_color = "orange"
@@ -400,27 +400,27 @@ def card_news(news_stock_map):
     lines = []
 
     # ── 利好消息 ──
-    lines.append("**🟢 利好消息及标的**")
+    lines.append("**🔴 利好消息及标的**")
     lines.append("")
     if bullish_items:
         for idx, (item, stocks) in enumerate(bullish_items):
             title = item.get("title", "")[:80]
             lines.append(f"**{idx + 1}. {title}**")
             for stock_name, chain, logic, d, kw in stocks:
-                lines.append(f"  🟢 <font color='green'>利好</font> **{stock_name}**  {chain} · {logic}")
+                lines.append(f"  🔴 <font color='red'>利好</font> **{stock_name}**  {chain} · {logic}")
     else:
         lines.append("暂无利好消息")
 
     # ── 利空消息 ──
     lines.append("")
-    lines.append("**🔴 利空消息及标的**")
+    lines.append("**🟢 利空消息及标的**")
     lines.append("")
     if bearish_items:
         for idx, (item, stocks) in enumerate(bearish_items):
             title = item.get("title", "")[:80]
             lines.append(f"**{idx + 1}. {title}**")
             for stock_name, chain, logic, d, kw in stocks:
-                lines.append(f"  🔴 <font color='red'>利空</font> **{stock_name}**  {chain} · {logic}")
+                lines.append(f"  🟢 <font color='green'>利空</font> **{stock_name}**  {chain} · {logic}")
     else:
         lines.append("暂无利空消息")
 
@@ -435,14 +435,14 @@ def card_news(news_stock_map):
 
         # 上半：利好
         half1_lines = []
-        half1_lines.append("**🟢 利好消息及标的**")
+        half1_lines.append("**🔴 利好消息及标的**")
         half1_lines.append("")
         if bullish_items:
             for idx, (item, stocks) in enumerate(bullish_items):
                 title = item.get("title", "")[:80]
                 half1_lines.append(f"**{idx + 1}. {title}**")
                 for stock_name, chain, logic, d, kw in stocks:
-                    half1_lines.append(f"  🟢 <font color='green'>利好</font> **{stock_name}**  {chain} · {logic}")
+                    half1_lines.append(f"  🔴 <font color='red'>利好</font> **{stock_name}**  {chain} · {logic}")
         else:
             half1_lines.append("暂无利好消息")
 
@@ -451,14 +451,14 @@ def card_news(news_stock_map):
 
         # 下半：利空
         half2_lines = []
-        half2_lines.append("**🔴 利空消息及标的**")
+        half2_lines.append("**🟢 利空消息及标的**")
         half2_lines.append("")
         if bearish_items:
             for idx, (item, stocks) in enumerate(bearish_items):
                 title = item.get("title", "")[:80]
                 half2_lines.append(f"**{idx + 1}. {title}**")
                 for stock_name, chain, logic, d, kw in stocks:
-                    half2_lines.append(f"  🔴 <font color='red'>利空</font> **{stock_name}**  {chain} · {logic}")
+                    half2_lines.append(f"  🟢 <font color='green'>利空</font> **{stock_name}**  {chain} · {logic}")
         else:
             half2_lines.append("暂无利空消息")
 
@@ -530,19 +530,26 @@ def card_theme_preview(news_stock_map, last_trade_date_str):
     else:
         lines.append("未识别到明确热点方向")
 
-    # ── 上周涨停方向 ──
+    # ── 上周概念题材热度 ──
     lines.append("")
-    lines.append("**上周涨停行业分布**")
+    lines.append("**概念题材热度（上周五）**")
     lines.append("")
-    if up_industries:
-        for ind, cnt, stocks in up_industries[:8]:
+    concepts = heat.get("concepts") if heat else None
+    if concepts:
+        for tag, cnt, stocks in concepts[:8]:
             top_names = ", ".join(s["name"] for s in stocks[:3])
-            lines.append(f"• **{ind}** {cnt}只涨停 — {top_names}")
+            lines.append(f"• **{tag}** {cnt}只 — {top_names}")
     else:
-        if heat:
-            lines.append(f"涨停池数据源: {heat.get('up_src', '未知')}，涨停 {heat.get('up_count', 0)} 只")
+        up_industries = heat.get("up_industries", []) if heat else []
+        if up_industries:
+            for ind, cnt, stocks in up_industries[:8]:
+                top_names = ", ".join(s["name"] for s in stocks[:3])
+                lines.append(f"• **{ind}** {cnt}只涨停 — {top_names}")
         else:
-            lines.append("涨停数据获取失败")
+            if heat:
+                lines.append(f"涨停池数据源: {heat.get('up_src', '未知')}，涨停 {heat.get('up_count', 0)} 只")
+            else:
+                lines.append("题材数据获取失败")
 
     # ── 连板持续题材 ──
     lines.append("")
@@ -590,22 +597,22 @@ def card_theme_preview(news_stock_map, last_trade_date_str):
 
     # 共振判断
     resonance = []
-    if news_mega_topics and limit_industries:
-        # 检查消息面与涨停方向的共振（模糊匹配）
+    if news_mega_topics and concepts:
+        concept_tags = set(tag for tag, _, _ in concepts)
         for news_topic in news_mega_topics:
-            for ind in limit_industries:
-                if news_topic in ind or ind in news_topic or any(
-                    kw in ind for kw in news_topic.split("/")
+            for tag in concept_tags:
+                if news_topic in tag or tag in news_topic or any(
+                    kw in tag for kw in news_topic.split("/")
                 ):
                     resonance.append(news_topic)
                     break
         resonance = list(set(resonance))
 
     if resonance:
-        lines.append(f"<font color='green'>消息面 + 上周涨停方向共振：{', '.join(resonance)}</font>")
+        lines.append(f"<font color='red'>消息面 + 上周概念题材共振：{', '.join(resonance)}</font>")
         lines.append("以上题材下周延续概率较高，重点关注龙头")
     else:
-        lines.append("<font color='orange'>消息面与上周涨停方向无明显共振</font>")
+        lines.append("<font color='orange'>消息面与上周概念题材无明显共振</font>")
         lines.append("关注消息面驱动的新题材启动机会")
 
     # 连板题材延续性
@@ -622,7 +629,7 @@ def card_theme_preview(news_stock_map, last_trade_date_str):
         sustained = list(set(sustained))
 
         if sustained:
-            lines.append(f"<font color='green'>连板题材+消息面共振：{', '.join(sustained)}</font>")
+            lines.append(f"<font color='red'>连板题材+消息面共振：{', '.join(sustained)}</font>")
             lines.append("这些题材有消息面支撑，连板行情可能延续")
         else:
             lines.append(f"<font color='orange'>连板题材（{', '.join(list(strong_industries)[:5])}）与消息面关联较弱</font>")
@@ -653,19 +660,19 @@ def card_next_week_strategy(news_stock_map, last_trade_date_str):
     # ── 市场情绪判断 ──
     if bullish_count > bearish_count * 2:
         sentiment = "消息面偏多，下周开盘情绪乐观"
-        sentiment_color = "green"
+        sentiment_color = "red"
         bias = "偏多"
     elif bearish_count > bullish_count * 2:
         sentiment = "消息面偏空，下周开盘需谨慎"
-        sentiment_color = "red"
+        sentiment_color = "green"
         bias = "偏空"
     elif bullish_count > bearish_count:
         sentiment = "消息面多空交织，整体偏多但需关注利空扰动"
-        sentiment_color = "green"
+        sentiment_color = "red"
         bias = "偏多"
     elif bearish_count > bullish_count:
         sentiment = "消息面多空交织，偏空因素略多"
-        sentiment_color = "red"
+        sentiment_color = "green"
         bias = "偏空"
     else:
         sentiment = "消息面多空均衡，方向不明确"

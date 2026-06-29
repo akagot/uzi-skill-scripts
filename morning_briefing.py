@@ -56,8 +56,8 @@ def _fetch_json(url, timeout=15, headers=None):
         return None
 
 def _color_tag(direction):
-    color_map = {"利好": "green", "利空": "red", "中性": "orange"}
-    arrow_map = {"利好": "🟢", "利空": "🔴", "中性": "🟡"}
+    color_map = {"利好": "red", "利空": "green", "中性": "orange"}
+    arrow_map = {"利好": "🔴", "利空": "🟢", "中性": "🟡"}
     return f"<font color='{color_map[direction]}'>{arrow_map[direction]} {direction}</font>"
 
 # ── 交易日判断（uzi_common 已支持 akshare fallback） ──
@@ -116,7 +116,7 @@ def get_us_overnight():
 
 # ── 盘前消息收集 ──
 def collect_premarket_news():
-    """收集盘前消息：金十数据 + 东财快讯 + 新浪财经"""
+    """收集盘前消息：金十数据 + 东财快讯 + 东财全球资讯 + 新浪财经"""
     log("收集盘前消息...")
     news_items = []
 
@@ -159,6 +159,21 @@ def collect_premarket_news():
             log(f"东财快讯: {min(15, len(data.get('LivesList', [])))} 条")
     except Exception as e:
         log(f"东财快讯失败: {e}")
+
+    # 东财全球资讯（7x24，替代财联社）
+    try:
+        from uzi_common import _eastmoney_global_news
+        items = _eastmoney_global_news(page_size=15)
+        if items:
+            for item in items[:15]:
+                news_items.append({
+                    "title": item.get("title", ""),
+                    "snippet": item.get("summary", "") or item.get("title", ""),
+                    "source": "东财全球资讯",
+                })
+            log(f"东财全球资讯: {min(15, len(items))} 条")
+    except Exception as e:
+        log(f"东财全球资讯失败: {e}")
 
     # 新浪全球宏观
     try:
@@ -353,7 +368,7 @@ def build_us_mapping(us_data):
     if us_data.get("indices"):
         lines.append("**三大指数**")
         for idx in us_data["indices"]:
-            color = "green" if idx["chg_pct"] >= 0 else "red"
+            color = "red" if idx["chg_pct"] >= 0 else "green"
             arrow = "📈" if idx["chg_pct"] >= 0 else "📉"
             lines.append(f"  {arrow} <font color='{color}'>{idx['name']}</font>: {idx['price']:.2f} ({idx['chg_pct']:+.2f}%)")
         lines.append("")
@@ -361,7 +376,7 @@ def build_us_mapping(us_data):
     if us_data.get("sectors"):
         lines.append("**板块ETF**")
         for s in us_data["sectors"][:8]:
-            color = "green" if s["chg_pct"] >= 0 else "red"
+            color = "red" if s["chg_pct"] >= 0 else "green"
             lines.append(f"  <font color='{color}'>{s['name']}</font> {s['chg_pct']:+.2f}%")
         lines.append("")
 
@@ -389,7 +404,7 @@ def build_us_mapping(us_data):
             code = stock["code"]
             a_stocks = us_to_a.get(code, [])
             if a_stocks:
-                color = "green" if stock["chg_pct"] >= 0 else "red"
+                color = "red" if stock["chg_pct"] >= 0 else "green"
                 arrow = "📈" if stock["chg_pct"] >= 0 else "📉"
                 lines.append(f"  {arrow} <font color='{color}'>{stock['name']}({code})</font> {stock['chg_pct']:+.2f}% → {', '.join(a_stocks)}")
 
@@ -405,11 +420,11 @@ def build_direction_cards(news_stock_map, direction, template_color):
             matching.append((item, dir_stocks))
 
     if not matching:
-        title_map = {"利好": "🟢 利好方向", "利空": "🔴 利空方向", "中性": "🟡 中性 / 待观察"}
+        title_map = {"利好": "🔴 利好方向", "利空": "🟢 利空方向", "中性": "🟡 中性 / 待观察"}
         send_card(title_map[direction], "暂无该方向消息", template_color)
         return
 
-    title_map = {"利好": "🟢 利好方向", "利空": "🔴 利空方向", "中性": "🟡 中性 / 待观察"}
+    title_map = {"利好": "🔴 利好方向", "利空": "🟢 利空方向", "中性": "🟡 中性 / 待观察"}
     section_title = title_map.get(direction, direction)
 
     lines = []
@@ -477,8 +492,8 @@ def card_overview(us_data, news_items, all_stocks, bullish_count, bearish_count,
 
     # 盘前消息统计
     lines.append(f"盘前消息：{len(news_items)} 条 | 关联标的：{len(set(s for s, _, _, _, _ in all_stocks))} 只")
-    lines.append(f"<font color='green'>▸ 利好：{bullish_count} 只标的</font>")
-    lines.append(f"<font color='red'>▸ 利空：{bearish_count} 只标的</font>")
+    lines.append(f"<font color='red'>▸ 利好：{bullish_count} 只标的</font>")
+    lines.append(f"<font color='green'>▸ 利空：{bearish_count} 只标的</font>")
     lines.append(f"<font color='orange'>▸ 中性：{neutral_count} 只标的</font>")
     lines.append("")
 
@@ -487,7 +502,7 @@ def card_overview(us_data, news_items, all_stocks, bullish_count, bearish_count,
         lines.append("**━━━ 美股三大指数 ━━━**")
         for idx in us_data["indices"]:
             if idx["name"] in ("道琼斯", "纳斯达克100", "标普500"):
-                color = "green" if idx["chg_pct"] >= 0 else "red"
+                color = "red" if idx["chg_pct"] >= 0 else "green"
                 arrow = "📈" if idx["chg_pct"] >= 0 else "📉"
                 if idx["price"] is not None and idx["chg_pct"] is not None:
                     lines.append(f"  {arrow} <font color='{color}'>{idx['name']}</font>: {idx['price']:.2f} ({idx['chg_pct']:+.2f}%)")
@@ -520,7 +535,7 @@ def card_overview(us_data, news_items, all_stocks, bullish_count, bearish_count,
             code = stock["code"]
             a_stocks = us_to_a.get(code, [])
             if a_stocks and stock["chg_pct"] is not None:
-                color = "green" if stock["chg_pct"] >= 0 else "red"
+                color = "red" if stock["chg_pct"] >= 0 else "green"
                 arrow = "📈" if stock["chg_pct"] >= 0 else "📉"
                 lines.append(f"  {arrow} <font color='{color}'>{stock['name']}({code})</font> {stock['chg_pct']:+.2f}% → {', '.join(a_stocks)}")
         lines.append("")
@@ -530,11 +545,11 @@ def card_overview(us_data, news_items, all_stocks, bullish_count, bearish_count,
         lines.append("**━━━ 板块ETF ━━━**")
         for s in us_data["sectors"][:8]:
             if s["chg_pct"] is not None:
-                color = "green" if s["chg_pct"] >= 0 else "red"
+                color = "red" if s["chg_pct"] >= 0 else "green"
                 lines.append(f"  <font color='{color}'>{s['name']}</font> {s['chg_pct']:+.2f}%")
         lines.append("")
 
-    lines.append("数据来源：金十数据 | 东财快讯 | 新浪全球宏观 | 自动化生成")
+    lines.append("数据来源：金十数据 | 东财快讯 | 东财全球资讯 | 新浪全球宏观 | 自动化生成")
     content = "\n".join(lines)
     send_card("🌍 隔夜外盘", content, "blue")
 
@@ -690,27 +705,26 @@ def card_theme_preview(news_stock_map, us_data):
         lines.append("  暂无明确消息面热点")
     lines.append("")
 
-    # ── 2. 昨日涨停方向 ──
-    lines.append("**━━━ 📈 昨日涨停行业分布 ━━━**")
+    # ── 2. 同花顺概念题材热度 ──
+    lines.append("**━━━ 📈 概念题材热度（昨日）━━━**")
     try:
         from datetime import datetime, timedelta
-        # 获取最近一个交易日的数据（如果是周一，则取上周五）
         yesterday = datetime.now() - timedelta(days=1)
         date_str = yesterday.strftime("%Y%m%d")
         heat = _theme_heat_safe(date_str)
-        up_industries = heat.get("up_industries", [])
-        if up_industries:
-            for ind, count, stock_list in up_industries[:8]:
-                stock_names = [s.get("name", "") for s in stock_list[:3]]
+        concepts = heat.get("concepts")
+        if concepts:
+            for tag, cnt, stocks in concepts[:8]:
+                stock_names = [s.get("name", "") for s in stocks[:3]]
                 stock_str = "、".join(stock_names)
-                if len(stock_list) > 3:
-                    stock_str += f" 等{count}只"
-                lines.append(f"  📊 **{ind}**（{count}只涨停）：{stock_str}")
+                if len(stocks) > 3:
+                    stock_str += f" 等{cnt}只"
+                lines.append(f"  📊 **{tag}**（{cnt}只）：{stock_str}")
         else:
-            lines.append("  昨日涨停数据暂无")
+            lines.append("  同花顺热点数据暂无")
     except Exception as e:
-        log(f"涨停行业分布获取失败: {e}")
-        lines.append("  涨停数据获取暂不可用")
+        log(f"概念题材获取失败: {e}")
+        lines.append("  题材数据获取暂不可用")
     lines.append("")
 
     # ── 3. 连板持续题材 ──
@@ -737,24 +751,29 @@ def card_theme_preview(news_stock_map, us_data):
     try:
         # 消息面题材关键词集合
         news_themes = set(theme_keywords.keys())
-        # 涨停行业集合
-        limit_up_industries = set(ind for ind, _, _ in up_industries[:8]) if up_industries else set()
         # 连板题材集合
         strong_industries = set(strong_themes.keys()) if strong_themes else set()
 
-        # 共振判断：消息面热点与涨停方向/连板题材是否重叠
-        resonance_news_up = news_themes & limit_up_industries  # 消息面 ∩ 涨停
+        # 共振判断：消息面热点与概念题材/连板题材是否重叠
+        resonance_news_concept = set()
+        if concepts:
+            concept_tags = set(tag for tag, _, _ in concepts)
+            for news_topic in news_themes:
+                for concept in concept_tags:
+                    if news_topic in concept or concept in news_topic:
+                        resonance_news_concept.add(news_topic)
+                        break
         resonance_news_strong = news_themes & strong_industries  # 消息面 ∩ 连板
-        resonance_all = news_themes & limit_up_industries & strong_industries  # 三者共振
+        resonance_all = resonance_news_concept & strong_industries  # 三者共振
 
         if resonance_all:
-            lines.append(f"  ✅ **强共振**：{', '.join(resonance_all)} 消息面+涨停+连板三重共振，题材延续性极强")
+            lines.append(f"  ✅ **强共振**：{', '.join(resonance_all)} 消息面+概念题材+连板三重共振，题材延续性极强")
         elif resonance_news_strong:
             lines.append(f"  🔥 **消息面+连板共振**：{', '.join(resonance_news_strong)} 消息面与连板题材共振，题材有望延续")
-        elif resonance_news_up:
-            lines.append(f"  📊 **消息面+涨停共振**：{', '.join(resonance_news_up)} 消息面与昨日涨停方向共振")
+        elif resonance_news_concept:
+            lines.append(f"  📊 **消息面+概念题材共振**：{', '.join(list(resonance_news_concept)[:5])} 消息面与昨日概念热度共振")
         else:
-            lines.append("  ⚠️ 消息面热点与昨日涨停/连板方向暂无共振，关注新题材启动")
+            lines.append("  ⚠️ 消息面热点与昨日概念/连板方向暂无共振，关注新题材启动")
 
         # 美股情绪对题材的影响
         major_indices = [idx for idx in us_data.get("indices", []) if idx["name"] in ("道琼斯", "纳斯达克100", "标普500")]

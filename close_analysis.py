@@ -70,19 +70,28 @@ def card_overview(indices):
 
 
 def card_theme_capital(heat, late_stocks):
-    lines = ["**💰 题材资金流向**\n"]
+    lines = ["**💰 概念题材资金流向**\n"]
 
-    # 涨停行业分布
-    up_ind = heat.get("up_industries", [])
-    lines.append("**🟢 涨停行业**（资金流入方向）")
-    if up_ind:
-        for ind, cnt, stocks in up_ind[:5]:
+    # 主数据：同花顺概念题材排名
+    concepts = heat.get("concepts")
+    if concepts:
+        lines.append("**📊 题材热度排名**（同花顺强势股归因）")
+        for tag, cnt, stocks in concepts[:10]:
             top_names = "、".join(s["name"] for s in stocks[:3])
-            lines.append(f"• {ind}：{cnt} 只 （{top_names}）")
+            lines.append(f"• **{tag}**：{cnt} 只 （{top_names}）")
     else:
-        lines.append("<font color='grey'>暂无涨停数据</font>")
+        lines.append("<font color='orange'>⚠️ 同花顺热点数据不可用</font>")
 
-    # 跌停行业分布
+    # 连板题材
+    strong = heat.get("strong_themes", {})
+    if strong:
+        top_strong = sorted(strong.items(), key=lambda x: -x[1]["count"])[:4]
+        lines.append("\n**🔗 连板题材**（持续热点）")
+        for ind, info in top_strong:
+            top_names = "、".join(s["name"] for s in info["stocks"][:3])
+            lines.append(f"• {ind}：{info['count']} 只 （{top_names}）")
+
+    # 跌停行业（资金流出）
     down_ind = heat.get("down_industries", [])
     if down_ind:
         lines.append("\n**🔴 跌停行业**（资金流出方向）")
@@ -90,50 +99,49 @@ def card_theme_capital(heat, late_stocks):
             top_names = "、".join(s["name"] for s in stocks[:2])
             lines.append(f"• {ind}：{cnt} 只 （{top_names}）")
 
-    # 新浪行业实时
-    hot = heat.get("hot_sectors", [])
-    cold = heat.get("cold_sectors", [])
-    if hot or cold:
-        lines.append("\n**📈 行业涨跌**（收盘）")
-        if hot:
-            lines.append("🟢 领涨")
-            for s in hot:
-                lines.append(f"  • {s['name']} {color_chg(s.get('chg_pct'))}  <font color='grey'>{s['count']}家 · 龙头 {s['lead_stock']}</font>")
-        if cold:
-            lines.append("🔴 领跌")
-            for s in cold:
-                lines.append(f"  • {s['name']} {color_chg(s.get('chg_pct'))}  <font color='grey'>{s['count']}家 · 龙头 {s['lead_stock']}</font>")
-
     # 尾盘抢筹
     if late_stocks:
         lines.append("\n**🏃 尾盘抢筹**（涨幅 5-9.5%）")
         for s in late_stocks[:5]:
             lines.append(f"• {s['name']}({s['code']}) {fmt_price(s.get('price'))}  {color_chg(s.get('change_pct'))}")
 
+    # 人气榜
+    hot_rank = heat.get("hot_rank")
+    if hot_rank:
+        lines.append("\n**🔥 人气榜 TOP5**")
+        for s in hot_rank[:5]:
+            tags = "、".join(s.get("concepts", [])[:2])
+            pop = s.get("pop_tag", "")
+            extra = f" · {pop}" if pop else ""
+            if tags:
+                extra += f" · [{tags}]"
+            lines.append(f"• #{s['rank']} {s['name']} {s['pct']}%{extra}")
+
     # 资金判断
     lines.append("\n**💡 资金流向判断**")
-    if up_ind and down_ind:
-        up_total = sum(cnt for _, cnt, _ in up_ind)
-        down_total = sum(cnt for _, cnt, _ in down_ind)
-        if up_total > down_total * 3:
-            flow = "资金高度集中做多，部分行业出现涨停潮"
-        elif up_total > down_total:
-            flow = "资金以做多为主，结构性行情"
-        else:
-            flow = "多空分歧明显，资金分散，需精选方向"
-        lines.append(f"<font color='grey'>{flow}</font>")
-    if heat.get("strong_themes"):
-        top_strong = sorted(heat["strong_themes"].items(), key=lambda x: -x[1]["count"])[:3]
+    if concepts:
+        top3_tags = "、".join(tag for tag, _, _ in concepts[:3])
+        lines.append(f"<font color='grey'>今日资金主攻方向：{top3_tags}</font>")
+    if strong:
+        top_strong = sorted(strong.items(), key=lambda x: -x[1]["count"])[:3]
         strong_names = "、".join(ind for ind, _ in top_strong)
         lines.append(f"<font color='grey'>持续热点：{strong_names}</font>")
 
     lines.append("\n---")
-    lines.append("<font color='grey'>数据：新浪行业 · akshare 涨停池  |  仅供参考</font>")
+    lines.append("<font color='grey'>数据：同花顺热点 · akshare 涨停池  |  仅供参考</font>")
     send_feishu_card(FEISHU_WEBHOOK, "💰 题材资金", "\n".join(lines), "orange", log=log)
 
 
-def card_hot_stocks(up, up_src, down, down_src, strong):
+def card_hot_stocks(up, up_src, down, down_src, strong, ths_limit=None):
     lines = ["**🎯 热门标的**\n"]
+
+    # 构建涨停揭秘 code→info 映射
+    ths_map = {}
+    if ths_limit:
+        for s in ths_limit:
+            code = s.get("code", "")
+            if code:
+                ths_map[code] = s
 
     # 涨停前排
     if up:
@@ -150,6 +158,18 @@ def card_hot_stocks(up, up_src, down, down_src, strong):
                 ind = s.get("industry", "")
                 if ind:
                     extra += f" · {ind}"
+            # 同花顺涨停揭秘增强
+            ths_info = ths_map.get(s.get("code", ""))
+            if ths_info:
+                sr = ths_info.get("seal_rate")
+                if sr is not None:
+                    extra += f" · 封板率{sr*100:.0f}%"
+                bt = ths_info.get("board_type", "")
+                if bt:
+                    extra += f" · {bt}"
+                reason = ths_info.get("reason", "")
+                if reason:
+                    extra += f"\n  <font color='grey'>└ {reason}</font>"
             lines.append(f"• {s['name']}({s['code']}) {fmt_price(s.get('price'))}  {color_chg(s.get('chg_pct'))}{extra}")
 
     # 连板/强势股
@@ -161,6 +181,18 @@ def card_hot_stocks(up, up_src, down, down_src, strong):
             ind = s.get("industry", "")
             extra = f" · {zt_stat}" if zt_stat else ""
             extra += f" · {ind}" if ind else ""
+            # 同花顺涨停揭秘增强
+            ths_info = ths_map.get(s.get("code", ""))
+            if ths_info:
+                sr = ths_info.get("seal_rate")
+                if sr is not None:
+                    extra += f" · 封板率{sr*100:.0f}%"
+                bt = ths_info.get("board_type", "")
+                if bt:
+                    extra += f" · {bt}"
+                ths_reason = ths_info.get("reason", "")
+                if ths_reason:
+                    extra += f"\n  <font color='grey'>└ {ths_reason}</font>"
             lines.append(f"• {s['name']}({s['code']}) {fmt_price(s.get('price'))}  {color_chg(s.get('chg_pct'))}{extra}")
 
     # 跌停
@@ -175,7 +207,7 @@ def card_hot_stocks(up, up_src, down, down_src, strong):
         lines.append("<font color='grey'>暂无涨停数据</font>")
 
     lines.append("\n---")
-    lines.append("<font color='grey'>数据：akshare 涨停池/连板池  |  仅供参考</font>")
+    lines.append("<font color='grey'>数据：同花顺涨停揭秘 · akshare 涨停池/连板池  |  仅供参考</font>")
     send_feishu_card(FEISHU_WEBHOOK, "🎯 热门标的", "\n".join(lines), "green", log=log)
 
 
@@ -185,13 +217,13 @@ def card_strategy(indices, heat, late_stocks):
         sh_chg = sh_idx.get("chg_pct") if sh_idx else None
         if sh_chg is not None:
             if sh_chg > 1.5:
-                sentiment, color = "强势收涨，多头主导", "green"
+                sentiment, color = "强势收涨，多头主导", "red"
             elif sh_chg > 0:
-                sentiment, color = "小幅收涨，情绪偏多", "green"
+                sentiment, color = "小幅收涨，情绪偏多", "red"
             elif sh_chg > -1.0:
                 sentiment, color = "震荡偏弱，多空胶着", "orange"
             else:
-                sentiment, color = "明显收跌，注意风险", "red"
+                sentiment, color = "明显收跌，注意风险", "green"
         else:
             sentiment, color = "数据获取失败", "orange"
     else:
@@ -201,8 +233,8 @@ def card_strategy(indices, heat, late_stocks):
     down_n = heat.get("down_count", 0)
     strong_n = heat.get("strong_count", 0)
     late_n = len(late_stocks)
-    up_ind = heat.get("up_industries", [])
-    hot_themes = "、".join(ind for ind, _, _ in up_ind[:3]) if up_ind else "暂无"
+    concepts = heat.get("concepts")
+    hot_themes = "、".join(tag for tag, _, _ in concepts[:3]) if concepts else "暂无"
 
     body = f"""**🧠 明日策略**
 
@@ -247,7 +279,7 @@ def main():
     time.sleep(0.5)
     card_theme_capital(heat, late)
     time.sleep(0.5)
-    card_hot_stocks(up, up_src, down, down_src, strong)
+    card_hot_stocks(up, up_src, down, down_src, strong, heat.get("ths_limit"))
     time.sleep(0.5)
     card_strategy(indices, heat, late)
     log("收盘复盘完成")

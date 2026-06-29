@@ -72,44 +72,50 @@ def card_overview(indices, us_idx_map):
 
 
 def card_theme_heat(heat):
-    lines = ["**🔥 题材热度**\n"]
+    lines = ["**🔥 概念题材热度**\n"]
 
-    # 涨停行业分布（昨日）
-    lines.append("**涨停行业分布**（昨日）")
-    up_ind = heat.get("up_industries", [])
-    if up_ind:
-        for ind, cnt, stocks in up_ind[:6]:
+    # 主数据：同花顺概念题材排名
+    concepts = heat.get("concepts")
+    if concepts:
+        lines.append("**📊 题材热度排名**（同花顺强势股归因）")
+        for tag, cnt, stocks in concepts[:10]:
             top_names = "、".join(s["name"] for s in stocks[:3])
-            lines.append(f"• {ind}：{cnt} 只 （{top_names}）")
+            lines.append(f"• **{tag}**：{cnt} 只 （{top_names}）")
     else:
-        lines.append("<font color='grey'>昨日无涨停数据</font>")
+        lines.append("<font color='orange'>⚠️ 同花顺热点数据不可用</font>")
 
-    # 连板题材
+    # 连板题材（持续热点）
     strong = heat.get("strong_themes", {})
     if strong:
         top_strong = sorted(strong.items(), key=lambda x: -x[1]["count"])[:4]
-        lines.append("\n**连板题材**（持续热点）")
+        lines.append("\n**🔗 连板题材**（持续热点）")
         for ind, info in top_strong:
             top_names = "、".join(s["name"] for s in info["stocks"][:3])
             lines.append(f"• {ind}：{info['count']} 只 （{top_names}）")
 
-    # 新浪行业领涨/领跌
-    hot = heat.get("hot_sectors", [])
-    cold = heat.get("cold_sectors", [])
-    if hot or cold:
-        lines.append("\n**行业板块**（实时）")
-        if hot:
-            lines.append("🟢 领涨")
-            for s in hot:
-                lines.append(f"  • {s['name']} {color_chg(s.get('chg_pct'))}  <font color='grey'>龙头 {s['lead_stock']}</font>")
-        if cold:
-            lines.append("🔴 领跌")
-            for s in cold:
-                lines.append(f"  • {s['name']} {color_chg(s.get('chg_pct'))}  <font color='grey'>龙头 {s['lead_stock']}</font>")
+    # 涨停行业分布（昨日，辅助参考）
+    up_ind = heat.get("up_industries", [])
+    if up_ind:
+        lines.append("\n**涨停行业分布**（昨日，参考）")
+        for ind, cnt, stocks in up_ind[:4]:
+            top_names = "、".join(s["name"] for s in stocks[:2])
+            lines.append(f"• {ind}：{cnt} 只 （{top_names}）")
+
+    # 人气榜
+    hot_rank = heat.get("hot_rank")
+    if hot_rank:
+        lines.append("\n**🔥 人气榜 TOP5**")
+        for s in hot_rank[:5]:
+            tags = "、".join(s.get("concepts", [])[:2])
+            pop = s.get("pop_tag", "")
+            extra = f" · {pop}" if pop else ""
+            if tags:
+                extra += f" · [{tags}]"
+            lines.append(f"• #{s['rank']} {s['name']} {s['pct']}%{extra}")
 
     lines.append("\n---")
-    lines.append("<font color='grey'>数据：新浪行业 · akshare 涨停池  |  仅供参考</font>")
-    send_feishu_card(FEISHU_WEBHOOK, "🔥 题材热度", "\n".join(lines), "orange", log=log)
+    lines.append("<font color='grey'>数据：同花顺热点 · akshare 涨停池  |  仅供参考</font>")
+    send_feishu_card(FEISHU_WEBHOOK, "🔥 概念题材", "\n".join(lines), "orange", log=log)
 
 
 def card_auction(up, down):
@@ -118,11 +124,11 @@ def card_auction(up, down):
         lines.append("<font color='orange'>⚠️ 异动数据获取失败</font>")
     else:
         if up:
-            lines.append("**领涨活跃股** 🟢")
+            lines.append("**领涨活跃股** 🔴")
             for s in up:
                 lines.append(f"• {s['name']}({s['code']}) {fmt_price(s.get('price'))}  {color_chg(s.get('change_pct'))}")
         if down:
-            lines.append("\n**领跌活跃股** 🔴")
+            lines.append("\n**领跌活跃股** 🟢")
             for s in down:
                 lines.append(f"• {s['name']}({s['code']}) {fmt_price(s.get('price'))}  {color_chg(s.get('change_pct'))}")
     lines.append("\n---")
@@ -136,13 +142,13 @@ def card_judgment(indices, heat, up, down):
         sh_chg = sh_idx.get("chg_pct") if sh_idx else None
         if sh_chg is not None:
             if sh_chg > 0.5:
-                sentiment, color = "竞价高开高走，指数强势", "green"
+                sentiment, color = "竞价高开高走，指数强势", "red"
             elif sh_chg > 0:
-                sentiment, color = "竞价小幅高开，情绪温和", "green"
+                sentiment, color = "竞价小幅高开，情绪温和", "red"
             elif sh_chg > -0.5:
                 sentiment, color = "竞价小幅低开，关注承接", "orange"
             else:
-                sentiment, color = "竞价大幅低开，注意风险", "red"
+                sentiment, color = "竞价大幅低开，注意风险", "green"
         else:
             sentiment, color = "数据获取失败", "orange"
     else:
@@ -151,8 +157,8 @@ def card_judgment(indices, heat, up, down):
     up_n = len(up)
     down_n = len(down)
     # 热门题材
-    up_ind = heat.get("up_industries", [])
-    hot_themes = "、".join(ind for ind, _, _ in up_ind[:3]) if up_ind else "暂无"
+    concepts = heat.get("concepts")
+    hot_themes = "、".join(tag for tag, _, _ in concepts[:4]) if concepts else "暂无"
 
     body = f"""**🧠 早盘研判**
 

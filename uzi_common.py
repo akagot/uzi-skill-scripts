@@ -305,7 +305,7 @@ def is_trading_day(date_obj=None):
 def color_chg(chg):
     if chg is None:
         return "<font color='grey'>--</font>"
-    color = "green" if chg >= 0 else "red"
+    color = "red" if chg >= 0 else "green"
     arrow = "📈" if chg >= 0 else "📉"
     return f"{arrow} <font color='{color}'>{chg:+.2f}%</font>"
 
@@ -640,6 +640,92 @@ def _sector_spot_sina():
 
 
 # ═══════════════════════════════════════════════════════════════
+# 东财全球资讯（7x24）· 替代已下线的财联社快讯
+# 参考 a-stock-data SKILL §5.3
+# ═══════════════════════════════════════════════════════════════
+def _eastmoney_global_news(page_size=30):
+    """东方财富全球财经资讯（7x24 滚动）。
+    返回: [{title, summary, time}]
+    """
+    import uuid
+    url = "https://np-weblist.eastmoney.com/comm/web/getFastNewsList"
+    params = {
+        "client": "web", "biz": "web_724",
+        "fastColumn": "102", "sortEnd": "",
+        "pageSize": str(page_size),
+        "req_trace": str(uuid.uuid4()),
+    }
+    try:
+        text = _http_get_text(f"{url}?{'&'.join(f'{k}={v}' for k,v in params.items())}",
+                              timeout=10, retries=2,
+                              extra_headers={"Referer": "https://kuaixun.eastmoney.com/"})
+        if not text:
+            return None
+        data = json.loads(text)
+        rows = []
+        for item in data.get("data", {}).get("fastNewsList", []):
+            rows.append({
+                "title": item.get("title", ""),
+                "summary": (item.get("summary", "") or "")[:200],
+                "time": item.get("showTime", ""),
+            })
+        return rows
+    except Exception as e:
+        print(f"[EM NEWS] 东财全球资讯不可用: {e}", file=sys.stderr)
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════
+# 同花顺涨停揭秘 · 涨停原因题材 + 封板成功率 + 板型
+# 参考 a-stock-data SKILL §8.2
+# ═══════════════════════════════════════════════════════════════
+def _ths_limit_up_pool(date_str=None):
+    """同花顺涨停揭秘（涨停原因 + 封板质量增强源）。date_str=YYYYMMDD。
+    返回每只: code/name/price/pct/reason(涨停原因题材)/board_type(换手板/一字板/T字板)/
+    seal_rate(封板成功率,0~1)/break_times(炸板次数)/seal_amount(封单额,元)/
+    high_days(几天几板)/first_time(首次涨停时间)/is_again(是否回封 0/1)
+    """
+    if date_str is None:
+        date_str = datetime.now().strftime("%Y%m%d")
+    url = "https://data.10jqka.com.cn/dataapi/limit_up/limit_up_pool"
+    params = {
+        "page": 1, "limit": 200,
+        "field": "199112,10,9001,330323,330324,330325,9002,330329,133971,133970,1968584,3475914,9003,9004",
+        "filter": "HS,GEM2STAR", "order_field": "330324", "order_type": "0", "date": date_str,
+    }
+    try:
+        data = _http_get_json(f"{url}?{'&'.join(f'{k}={v}' for k,v in params.items())}", timeout=10, retries=2)
+        if not data:
+            return None
+        info = (data.get("data") or {}).get("info", [])
+    except Exception as e:
+        print(f"[THS LIMIT] 涨停揭秘不可用: {e}", file=sys.stderr)
+        return None
+    out = []
+    for it in info:
+        ft = it.get("first_limit_up_time")
+        try:
+            first_time = datetime.fromtimestamp(int(ft)).strftime("%H:%M:%S") if ft else ""
+        except (ValueError, TypeError, OSError):
+            first_time = ""
+        out.append({
+            "code": str(it.get("code", "")),
+            "name": str(it.get("name", "")),
+            "price": it.get("latest"),
+            "pct": it.get("change_rate"),
+            "reason": str(it.get("reason_type", "") or ""),
+            "board_type": str(it.get("limit_up_type", "") or ""),
+            "seal_rate": it.get("limit_up_suc_rate"),
+            "break_times": it.get("open_num") or 0,
+            "seal_amount": it.get("order_amount"),
+            "high_days": str(it.get("high_days", "") or ""),
+            "first_time": first_time,
+            "is_again": it.get("is_again_limit"),
+        })
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════
 # 题材热度分析 · 涨停池/跌停池/连板池 行业聚合
 # ═══════════════════════════════════════════════════════════════
 def _aggregate_pool_by_industry(pool):
@@ -656,24 +742,124 @@ def _aggregate_pool_by_industry(pool):
     return [(ind, len(stocks), stocks) for ind, stocks in ranked]
 
 
+# ═══════════════════════════════════════════════════════════════
+# 同花顺热点 · 概念题材热度（v4 核心数据源）
+# 参考 a-stock-data SKILL §3.1 · 同花顺热点接口
+# 零鉴权、73ms 响应、返回当日强势股 + 人工运营题材标签
+# ═══════════════════════════════════════════════════════════════
+def _ths_hot_reason(date_str=None):
+    """同花顺当日强势股归因。
+    返回 list[dict]: [{name, code, reason, pct, turnover, amount, ...}]
+    reason 字段是核心：人工运营题材标签，如 '算力租赁+Token工厂+AI政务'
+    """
+    if date_str is None:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+    elif len(date_str) == 8:  # YYYYMMDD → YYYY-MM-DD
+        date_str = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+    try:
+        url = (
+            f"http://zx.10jqka.com.cn/event/api/getharden/"
+            f"date/{date_str}/orderby/date/orderway/desc/charset/GBK/"
+        )
+        text = _http_get_text(url, timeout=10, retries=2, encoding="gbk")
+        if not text:
+            return None
+        data = json.loads(text)
+        if data.get("errocode", 0) != 0:
+            print(f"[THS HOT] 接口错误: {data.get('errormsg', '')}", file=sys.stderr)
+            return None
+        rows = data.get("data") or []
+        out = []
+        for r in rows:
+            out.append({
+                "name": str(r.get("name", "")),
+                "code": str(r.get("code", "")),
+                "reason": str(r.get("reason", "")),
+                "pct": float(r.get("zhangfu", 0)),
+                "price": float(r.get("close", 0)) if r.get("close") else None,
+                "turnover": float(r.get("huanshou", 0)),
+                "amount": float(r.get("chengjiaoe", 0)),
+                "dde": float(r.get("ddejingliang", 0)),
+            })
+        return out
+    except Exception as e:
+        print(f"[THS HOT] 不可用: {e}", file=sys.stderr)
+        return None
+
+
+def _ths_concept_heat(date_str=None):
+    """从同花顺热点提取题材热度排名。
+    返回: {
+        "concepts": [(题材标签, 数量, 股票列表), ...],  # 按热度降序
+        "stocks": [{name, code, reason, pct, ...}],     # 原始强势股列表
+        "total": int,  # 强势股总数
+        "date": str,
+    }
+    """
+    stocks = _ths_hot_reason(date_str)
+    if stocks is None:
+        return None
+    # 提取所有题材标签
+    tag_buckets = {}
+    for s in stocks:
+        reason = s.get("reason", "")
+        tags = [t.strip() for t in reason.split("+") if t.strip()]
+        for t in tags:
+            if t not in tag_buckets:
+                tag_buckets[t] = []
+            tag_buckets[t].append(s)
+    ranked = sorted(tag_buckets.items(), key=lambda x: -len(x[1]))
+    return {
+        "concepts": [(tag, len(stocks_list), stocks_list) for tag, stocks_list in ranked],
+        "stocks": stocks,
+        "total": len(stocks),
+        "date": date_str or datetime.now().strftime("%Y-%m-%d"),
+    }
+
+
+def _ths_hot_rank():
+    """同花顺人气榜 TOP 50（含概念标签）。
+    返回 list[dict]: [{rank, name, code, heat(人气值), pct, concepts, tag}]
+    """
+    try:
+        url = "https://dq.10jqka.com.cn/fuyao/hot_list_data/out/hot_list/v1/stock"
+        params = "stock_type=a&type=day&list_type=normal"
+        text = _http_get_text(f"{url}?{params}", timeout=10, retries=2)
+        if not text:
+            return None
+        data = json.loads(text)
+        rows = data.get("data", {}).get("stock_list", [])
+        out = []
+        for it in rows:
+            tag = it.get("tag") or {}
+            out.append({
+                "rank": it.get("order"),
+                "name": it.get("name", ""),
+                "code": it.get("code", ""),
+                "heat": it.get("rate", 0),
+                "pct": it.get("rise_and_fall", 0),
+                "concepts": tag.get("concept_tag") or [],
+                "pop_tag": tag.get("popularity_tag", ""),
+            })
+        return out
+    except Exception as e:
+        print(f"[THS RANK] 不可用: {e}", file=sys.stderr)
+        return None
+
+
 def _theme_heat_from_pools(limit_up, limit_down, strong_pool):
-    """综合题材热度分析
+    """综合题材热度分析（保留涨停池行业聚合作为辅助）
     返回: {
         "up_industries": [(行业, 数量, 股票列表), ...],
         "down_industries": [(行业, 数量, 股票列表), ...],
-        "strong_themes": {行业: {"count": N, "stocks": [...]}},  # 连板题材
-        "hot_sectors": [...],  # 新浪行业领涨 TOP5
-        "cold_sectors": [...],  # 新浪行业领跌 TOP5
+        "strong_themes": {行业: {"count": N, "stocks": [...]}},
     }
     """
     result = {
         "up_industries": _aggregate_pool_by_industry(limit_up) if limit_up else [],
         "down_industries": _aggregate_pool_by_industry(limit_down) if limit_down else [],
         "strong_themes": {},
-        "hot_sectors": [],
-        "cold_sectors": [],
     }
-    # 连板题材
     if strong_pool:
         for s in strong_pool:
             ind = s.get("industry", "其他")
@@ -681,19 +867,14 @@ def _theme_heat_from_pools(limit_up, limit_down, strong_pool):
                 result["strong_themes"][ind] = {"count": 0, "stocks": []}
             result["strong_themes"][ind]["count"] += 1
             result["strong_themes"][ind]["stocks"].append(s)
-    # 新浪行业
-    sectors = _sector_spot_sina()
-    if sectors:
-        result["hot_sectors"] = [s for s in sectors if (s.get("chg_pct") or 0) > 0][:5]
-        result["cold_sectors"] = [s for s in sectors if (s.get("chg_pct") or 0) < 0][-5:]
-        result["cold_sectors"].reverse()  # 跌幅从大到小
     return result
 
 
 def _theme_heat_safe(date_str=None):
-    """安全获取题材热度 · 涨停池+跌停池+连板池+新浪行业"""
+    """安全获取题材热度 · 同花顺概念题材(主) + 涨停池(辅) + 连板池 + 人气榜 + 涨停揭秘"""
     if date_str is None:
         date_str = datetime.now().strftime("%Y%m%d")
+    date_dash = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
     up, up_src = _fetch_limit_pool_safe(date_str)
     down, down_src = _fetch_dt_pool_safe(date_str)
     strong = _fetch_strong_pool_ak(date_str)
@@ -703,4 +884,37 @@ def _theme_heat_safe(date_str=None):
     heat["up_count"] = len(up)
     heat["down_count"] = len(down)
     heat["strong_count"] = len(strong) if strong else 0
+    # 主数据源：同花顺概念题材热度
+    concept = _ths_concept_heat(date_dash)
+    if concept:
+        heat["concepts"] = concept["concepts"]
+        heat["ths_stocks"] = concept["stocks"]
+        heat["ths_total"] = concept["total"]
+    else:
+        heat["concepts"] = None
+        heat["ths_stocks"] = None
+        heat["ths_total"] = 0
+    # 同花顺涨停揭秘（封板率+板型+涨停原因）
+    ths_limit = _ths_limit_up_pool(date_str)
+    if ths_limit:
+        heat["ths_limit"] = ths_limit
+        # 按涨停原因聚合题材热度（辅助 concepts）
+        reason_buckets = {}
+        for s in ths_limit:
+            reason = s.get("reason", "")
+            tags = [t.strip() for t in reason.split("+") if t.strip()]
+            for t in tags:
+                if t not in reason_buckets:
+                    reason_buckets[t] = []
+                reason_buckets[t].append(s)
+        heat["reason_concepts"] = sorted(reason_buckets.items(), key=lambda x: -len(x[1]))
+    else:
+        heat["ths_limit"] = None
+        heat["reason_concepts"] = None
+    # 人气榜
+    hot_rank = _ths_hot_rank()
+    if hot_rank:
+        heat["hot_rank"] = hot_rank[:20]
+    else:
+        heat["hot_rank"] = None
     return heat
