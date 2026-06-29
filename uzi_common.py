@@ -377,10 +377,10 @@ HK_TECH_LEADERS = [
 ]
 
 A_SHARE_INDICES = [
-    ("000001", "上证指数"), ("399001", "深证成指"),
-    ("399006", "创业板指"), ("000688", "科创50"),
-    ("000300", "沪深300"), ("000016", "上证50"),
-    ("399905", "中证500"),
+    ("sh000001", "上证指数"), ("sz399001", "深证成指"),
+    ("sz399006", "创业板指"), ("sh000688", "科创50"),
+    ("sh000300", "沪深300"), ("sh000016", "上证50"),
+    ("sz399905", "中证500"),
 ]
 
 A_SHARE_SECTOR_ETFS = [
@@ -431,15 +431,25 @@ A_SHARE_BLUE_CHIPS = [
 
 
 def _index_quotes():
-    """A 股大盘指数"""
-    pairs = [(c, "A") for c, _ in A_SHARE_INDICES]
-    qs = fetch_qt_quotes(pairs)
-    by_code = {q["code"]: q for q in qs}
+    """A 股大盘指数 · 直接用 qt 代码，不走 _qt_code_for（避免 sh000001 被映射到 sz000001）"""
+    qt_codes = [c for c, _ in A_SHARE_INDICES]
+    # 直接拉取 qt 数据，不经过 _qt_code_for 转换
+    url = "https://qt.gtimg.cn/q=" + ",".join(qt_codes)
+    text = _http_get_text(url, timeout=15, retries=2, encoding="gbk")
+    if not text:
+        return []
+    results = []
+    for line in text.splitlines():
+        r = _parse_qt_line(line)
+        if r:
+            results.append(r)
+    by_code = {q["code"]: q for q in results}
     out = []
-    for c, name in A_SHARE_INDICES:
-        q = by_code.get(c)
+    for qt_code, name in A_SHARE_INDICES:
+        pure_code = qt_code[2:]  # sh000001 → 000001
+        q = by_code.get(pure_code)
         if q and q.get("price") is not None:
-            out.append({"name": name, "code": c, "price": q["price"], "chg_pct": q.get("change_pct")})
+            out.append({"name": name, "code": pure_code, "price": q["price"], "chg_pct": q.get("change_pct")})
     return out
 
 
