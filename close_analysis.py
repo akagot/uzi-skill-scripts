@@ -19,19 +19,30 @@ from uzi_common import (
     limit_up_sentiment, em_zt_pool, em_zb_pool, em_dt_pool, em_yzt_pool,
     _ths_limit_up_pool, _fmt_zt_time,
     fetch_latest_skill,
+    _fmt_seal, _get_concept_tags, build_ladder_card, _ths_north_bound, _em_lhb_daily,
     _a_share_active_stocks,
     send_feishu_card, color_chg, fmt_price, fmt_amount_yi, is_trading_day, make_logger,
+    _index_tech_analysis, _index_tech_card,
+    _market_breadth, _market_breadth_card,
+    _limit_up_sentiment_v2, _em_hot_rank_v2,
 )
 
 LOG_FILE = Path("/tmp/uzi_close_analysis.log")
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/96d30f0a-639b-40c8-8ed5-1028ea80bef9"
+MAX_BYTES = 18000
 log = make_logger(LOG_FILE)
+
+# 共享 send_card 本地包装
+from uzi_common import send_card as _send_card
+send_card = lambda title, content, template="blue": _send_card(FEISHU_WEBHOOK, title, content, template, MAX_BYTES, log_func=log)
 
 # ── 1. 收盘概览 ──
 def get_overview():
     indices = _index_quotes()
-    log(f"指数: {len(indices)} 条")
-    return indices
+    tech = _index_tech_analysis()
+    breadth = _market_breadth()
+    log(f"指数: {len(indices)} 条, 技术分析: {'有' if tech else '无'}, 情绪: {'有' if breadth else '无'}")
+    return indices, tech, breadth
 
 # ── 2. 题材资金 ──
 def get_theme_heat():
@@ -53,7 +64,7 @@ def get_late_stocks():
     return sorted(valid, key=lambda x: -x["change_pct"])[:8]
 
 # ── 推送卡片 ──
-def card_overview(indices):
+def card_overview(indices, tech=None, breadth=None):
     lines = ["**📊 收盘·大盘指数**\n"]
     if indices:
         lines.append("| 指数 | 点位 | 涨跌幅 |")
@@ -71,6 +82,16 @@ def card_overview(indices):
         up_count = sum(1 for i in indices if (i.get("chg_pct") or 0) > 0)
         total = len(indices)
         lines.append(f"\n<font color='grey'>指数上涨 {up_count}/{total}，市场情绪偏{'强' if up_count >= total/2 else '弱'}</font>")
+
+    # 上证技术分析
+    tech_card = _index_tech_card(tech)
+    if tech_card:
+        lines.append(tech_card)
+
+    # 市场情绪
+    breadth_card = _market_breadth_card(breadth)
+    if breadth_card:
+        lines.append(breadth_card)
 
     lines.append("\n---")
     lines.append("<font color='grey'>数据：腾讯 qt  |  仅供参考</font>")
@@ -237,226 +258,6 @@ def card_hot_stocks(up, up_src, down, down_src, strong, ths_limit=None):
     send_feishu_card(FEISHU_WEBHOOK, "🎯 热门标的", "\n".join(lines), "green", log=log)
 
 
-def _fmt_seal(amt):
-    """封单金额格式化: 1.23亿 / 8210万"""
-    if amt is None or amt == 0:
-        return "--"
-    if amt >= 1e8:
-        return f"{amt/1e8:.2f}亿"
-    return f"{amt/1e4:.0f}万"
-
-def _get_concept_tags(s, ths_map):
-    """获取一只股票的题材标签列表（从同花顺涨停原因拆分）"""
-    c = s["code"]
-    t = ths_map.get(c, {})
-    reason = t.get("reason", "") or s.get("industry", "")
-    if not reason:
-        return []
-    return [r.strip() for r in reason.split("+") if r.strip()]
-
-def card_ladder(date_str=None):
-    """连板天梯 — 二板起详细列 + 一板概念统计 + 题材纵深"""
-    if date_str is None:
-        date_str = datetime.now().strftime("%Y%m%d")
-    try:
-        all_zt = em_zt_pool(date_str)
-        yzt = em_yzt_pool(date_str)
-        ths = _ths_limit_up_pool(date_str)
-    except Exception as e:
-        log(f"连板天梯数据获取失败: {e}")
-        send_feishu_card(FEISHU_WEBHOOK, "📊 连板天梯", "数据获取失败，请稍后重试", "blue", log=log)
-        return
-
-    # ── 分组 ──
-    groups = {1: [], 2: [], 3: [], 4: []}
-    for s in all_zt:
-        ld = s.get("limit_days", 1)
-        if ld <= 4:
-            groups[ld].append(s)
-        else:
-            groups.setdefault(5, []).append(s)
-
-    zb = em_zb_pool(date_str)
-    dt = em_dt_pool(date_str)
-    zt_n = len(all_zt)
-    zb_n = len(zb)
-    dt_n = len(dt)
-    br = round(zb_n / (zt_n + zb_n) * 100, 1) if (zt_n + zb_n) else 0
-    max_h = max((s.get("limit_days", 1) for s in all_zt), default=0)
-
-    # ── 同花顺数据映射 ──
-    ths_map = {}
-    if ths:
-        for t in ths:
-            ths_map[str(t.get("code", ""))] = t
-
-    # ── 构建概念题材纵深（{概念: {板数: [名称列表]}}）──
-    concept_depth = {}  # {concept: {1: [names], 2: [names], ...}}
-    for level in [1, 2, 3, 4, 5]:
-        for s in groups.get(level, []):
-            tags = _get_concept_tags(s, ths_map)
-            for tag in tags:
-                cd = concept_depth.setdefault(tag, {})
-                cd.setdefault(level, []).append(s["name"])
-
-    lines = ["**📊 连板天梯**\n"]
-
-    # ── 顶部 Tab 栏 ──
-    tabs = [
-        f"一板 {len(groups[1])}只",
-        f"二板 {len(groups[2])}只",
-        f"三板 {len(groups[3])}只",
-        f"四板 {len(groups[4])}只",
-        f"更高 {(groups.get(5) or []) and len(groups[5]) or 0}只",
-    ]
-    lines.append("  ".join(tabs))
-    lines.append(f"涨停: {zt_n}只 | 炸板: {zb_n}只 | 炸板率: {br}% | 跌停: {dt_n}只 | 最高: {max_h}板\n")
-
-    # ═══════════════════════════════════════════════
-    # 二板及以上详细列出
-    # ═══════════════════════════════════════════════
-    level_names = {2: "二板", 3: "三板", 4: "四板", 5: "更高板"}
-    max_per_level = {2: 8, 3: 10, 4: 10, 5: 10}
-
-    for level in [2, 3, 4, 5]:
-        stocks = groups.get(level, [])
-        if not stocks:
-            continue
-        # 按封单降序
-        stocks = sorted(stocks, key=lambda x: -(x.get("seal_fund") or 0))
-        show_n = max_per_level.get(level, 8)
-        lines.append(f"**━━━ {level_names[level]}（{len(stocks)}只）━━━**")
-        lines.append("| 名称 | 代码 | 标签 | 涨停时间 | 涨停原因 | 封单 |")
-        lines.append("|------|------|------|----------|----------|------|")
-        for s in stocks[:show_n]:
-            c = s["code"]
-            t = ths_map.get(c, {})
-            # 标签
-            tags = []
-            if t.get("is_again") == 1:
-                tags.append("<font color='red'>回封</font>")
-            elif s.get("break_times", 0) > 0 and t.get("is_again") != 1:
-                tags.append("<font color='green'>破板</font>")
-            tag_str = " ".join(tags) if tags else "-"
-
-            # 涨停原因
-            reason = t.get("reason", "") or s.get("industry", "")
-            if reason and len(reason) > 12:
-                reason = reason[:12] + ".."
-            reason_cell = reason if reason else "-"
-
-            # 封单
-            seal = _fmt_seal(s.get("seal_fund"))
-
-            # 涨停时间
-            first_seal = s.get('first_seal', '') or '-'
-
-            lines.append(
-                f"| {s['name']} | {c} | {tag_str} | {first_seal} | {reason_cell} | <font color='red'>{seal}</font> |"
-            )
-        if len(stocks) > show_n:
-            lines.append(f"  <font color='grey'>... 还有 {len(stocks)-show_n} 只</font>")
-        lines.append("")
-
-    # ═══════════════════════════════════════════════
-    # 一板：按概念题材统计
-    # ═══════════════════════════════════════════════
-    if groups[1]:
-        # 统计一板概念热度
-        yb_concepts = {}
-        for s in groups[1]:
-            tags = _get_concept_tags(s, ths_map)
-            for tag in tags:
-                yb_concepts[tag] = yb_concepts.get(tag, 0) + 1
-        yb_top = sorted(yb_concepts.items(), key=lambda x: -x[1])[:12]
-        morning = sum(1 for s in groups[1] if (s.get("first_seal") or "99") < "12:00")
-        afternoon = len(groups[1]) - morning
-        lines.append(f"**一板（{len(groups[1])}只）** 上午 {morning}只 | 下午 {afternoon}只")
-        if yb_top:
-            lines.append("| 概念 | 涨停数 |")
-            lines.append("|------|--------|")
-            for tag, cnt in yb_top:
-                lines.append(f"| **{tag}** | {cnt} |")
-        lines.append("")
-
-    # ═══════════════════════════════════════════════
-    # 题材纵深：某概念在多个板位都有标的
-    # ═══════════════════════════════════════════════
-    deep_concepts = []
-    for tag, levels in concept_depth.items():
-        total = sum(len(ns) for ns in levels.values())
-        if len(levels) >= 2 and total >= 2:
-            deep_concepts.append((tag, levels, total))
-    deep_concepts.sort(key=lambda x: (-len(x[1]), -x[2]))
-
-    if deep_concepts:
-        lines.append(f"**━━━ 题材纵深（{len(deep_concepts)}个概念横跨多板）━━━**")
-        lines.append("")
-        lines.append("| 概念 | 板位分布 |")
-        lines.append("|------|----------|")
-        for tag, levels, total in deep_concepts[:8]:
-            parts = []
-            for lv in sorted(levels.keys()):
-                names = levels[lv]
-                part = f"{lv}板: {', '.join(names[:4])}"
-                if len(names) > 4:
-                    part += f"等{len(names)}只"
-                parts.append(part)
-            lines.append(f"| <font color='red'>**{tag}**</font> | {'<br>'.join(parts)} |")
-        if len(deep_concepts) > 8:
-            lines.append(f"  <font color='grey'>... 还有 {len(deep_concepts)-8} 个纵深概念</font>")
-        lines.append("")
-
-    # ── 2板及以上未涨停（高标断板）──
-    if yzt:
-        y2_fail = [s for s in yzt if s.get("y_limit_days", 0) >= 2 and s.get("pct", 0) < 9.8]
-        if y2_fail:
-            y2_fail = sorted(y2_fail, key=lambda x: -(x.get("pct") or 0))
-            lines.append(f"**━━━ 未涨停的高标（昨日{min(s['y_limit_days'] for s in y2_fail)}~{max(s['y_limit_days'] for s in y2_fail)}板，{len(y2_fail)}只）━━━**")
-            lines.append("| 名称 | 代码 | 昨板数 | 现价 | 涨跌幅 | 行业 |")
-            lines.append("|------|------|--------|------|--------|------|")
-            for s in y2_fail[:8]:
-                price = s.get("price", 0)
-                pct = s.get("pct", 0)
-                color = "red" if pct >= 0 else "green"
-                arrow = "📈" if pct >= 0 else "📉"
-                y_ld = s.get("y_limit_days", 0)
-                ind = s.get("industry", "")
-                if ind and len(ind) > 12:
-                    ind = ind[:12] + ".."
-                ind_cell = ind if ind else "-"
-                lines.append(
-                    f"| {s['name']} | {s['code']} | {y_ld} | "
-                    f"<font color='{color}'>{fmt_price(price)}</font> | "
-                    f"{arrow} <font color='{color}'>{pct:+.2f}%</font> | "
-                    f"<font color='grey'>{ind_cell}</font> |"
-                )
-            if len(y2_fail) > 8:
-                lines.append(f"  <font color='grey'>... 还有 {len(y2_fail)-8} 只</font>")
-
-    # ── 晋级率 ──
-    yzt_total = len(yzt)
-    yzt_continue = sum(1 for s in yzt if s.get("pct", 0) >= 9.8)
-    jj_rate = round(yzt_continue / yzt_total * 100, 1) if yzt_total > 0 else 0
-    lines.append(f"\n昨涨停 {yzt_total}只 → 今日连板 {yzt_continue}只，晋级率 {jj_rate}%")
-
-    lines.append("\n---")
-    lines.append("<font color='grey'>数据：东财涨停板中心 · 同花顺涨停揭秘 | 仅供参考</font>")
-
-    # 分卡发送（如果超长）
-    text = "\n".join(lines)
-    if len(text.encode("utf-8")) > 16000:
-        split_idx = text.find("**━━━ 未涨停的高标")
-        if split_idx > 0:
-            main_text = text[:split_idx].strip()
-            fail_text = text[split_idx:].strip()
-            send_feishu_card(FEISHU_WEBHOOK, "📊 连板天梯", main_text, "turquoise", log=log)
-            time.sleep(0.3)
-            send_feishu_card(FEISHU_WEBHOOK, "📊 连板天梯（续）", fail_text, "turquoise", log=log)
-            return
-    send_feishu_card(FEISHU_WEBHOOK, "📊 连板天梯", text, "turquoise", log=log)
-
-
 def card_strategy(indices, heat, late_stocks):
     if indices:
         sh_idx = next((i for i in indices if "上证" in (i.get("name") or "")), None)
@@ -483,6 +284,9 @@ def card_strategy(indices, heat, late_stocks):
     strong_themes = heat.get("strong_themes", {})
     hot_rank = heat.get("hot_rank")
 
+    # 打板情绪 V2
+    sent_v2 = _limit_up_sentiment_v2()
+
     # ── 组装卡片 ──
     lines = [
         f"**🧠 明日策略**",
@@ -498,6 +302,31 @@ def card_strategy(indices, heat, late_stocks):
         f"| 连板 | {strong_n} 只 |",
         f"| 尾盘抢筹 | {late_n} 只 |",
     ]
+
+    # 打板情绪 V2 增强
+    if sent_v2:
+        lines.append(f"| 炸板率 | {sent_v2['break_rate']}% |")
+        lines.append(f"| 晋级率 | {sent_v2['advance_rate']}% · 最高{sent_v2['max_height']}板 |")
+        if sent_v2.get("profit_effect"):
+            pe = sent_v2["profit_effect"]
+            lines.append(f"| 赚钱效应 | 均{pe['avg_pct']:+.1f}% · 红盘{pe['red_ratio']}% |")
+
+    # 北向资金
+    nb = _ths_north_bound()
+    if nb:
+        nb_label = "北向净流入" if nb["total"] >= 0 else "北向净流出"
+        nb_line = f"| {nb_label} | {nb['total']:+.2f}亿 （沪{nb['sh']:+.2f} / 深{nb['sz']:+.2f}）"
+        if nb.get("consecutive", 0) > 0:
+            nb_line += f" · 连续{nb['consecutive']}日{nb['direction']} · 5日均值{nb['ma5']:+.2f}亿"
+        nb_line += " |"
+        lines.append(nb_line)
+
+    # 龙虎榜 TOP5 净买入
+    lhb = _em_lhb_daily()
+    if lhb:
+        lhb_top5 = lhb[:5]
+        lhb_names = "、".join(f"{s['name']}({s['net_buy_wan']:.0f}万)" for s in lhb_top5)
+        lines.append(f"| 龙虎榜TOP5 | {lhb_names} |")
 
     # 题材热度
     if concepts:
@@ -540,12 +369,6 @@ def card_strategy(indices, heat, late_stocks):
     lines.append("| 跌停集中于某行业扩散 | 行业系统性利空，回避 |")
     lines.append("| 缩量+涨停数减少 | 市场情绪退潮，控制仓位 |")
 
-    lines.append("")
-    lines.append("---")
-    lines.append("数据来源：同花顺热点 · 东财涨停池 · 东财涨停板中心 · 腾讯 qt")
-    lines.append("使用 a-stock-data SKILL 最新版本")
-    lines.append("声明：以上内容仅供市场信息参考，不构成任何投资建议")
-
     content = "\n".join(lines)
     send_card("🧠 明日策略", content, "red")
 
@@ -553,24 +376,22 @@ def card_strategy(indices, heat, late_stocks):
 def main():
     log("=" * 60)
     log("收盘复盘+尾盘抢筹启动 v4")
-    # 拉取最新 a-stock-data SKILL
-    fetch_latest_skill()
     if not is_trading_day():
         log("今日非交易日，跳过")
         return
 
-    indices = get_overview()
+    indices, tech, breadth = get_overview()
     heat = get_theme_heat()
     up, up_src, down, down_src, strong = get_hot_stocks()
     late = get_late_stocks()
 
-    card_overview(indices)
+    card_overview(indices, tech, breadth)
     time.sleep(0.5)
     card_theme_capital(heat, late)
     time.sleep(0.5)
     card_hot_stocks(up, up_src, down, down_src, strong, heat.get("ths_limit"))
     time.sleep(0.5)
-    card_ladder()
+    build_ladder_card(webhook=FEISHU_WEBHOOK, log_func=log)
     time.sleep(0.5)
     card_strategy(indices, heat, late)
     log("收盘复盘完成")

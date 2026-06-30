@@ -18,29 +18,14 @@ from pathlib import Path
 
 # ── 共享工具 ──
 sys.path.insert(0, str(Path(__file__).parent))
-from uzi_common import _http_get_text, send_feishu_card, is_trading_day, make_logger, _theme_heat_safe, _index_quotes, fetch_latest_skill
+from uzi_common import _http_get_text, send_feishu_card, send_card as _send_card, is_trading_day, make_logger, _theme_heat_safe, _index_quotes, fetch_latest_skill
 
 # ── 配置 ──
 LOG_FILE = Path("/tmp/uzi_morning_briefing.log")
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/96d30f0a-639b-40c8-8ed5-1028ea80bef9"
 MAX_BYTES = 18000
 log = make_logger(LOG_FILE)
-
-# ── 日志 ──
-def log(msg):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] {msg}"
-    print(line)
-    try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except:
-        pass
-
-# ── 飞书卡片（转发到 uzi_common） ──
-def send_card(title, content, template="blue"):
-    """包装 uzi_common.send_feishu_card"""
-    return send_feishu_card(FEISHU_WEBHOOK, title, content, template, MAX_BYTES, log=log)
+send_card = lambda title, content, template="blue": _send_card(FEISHU_WEBHOOK, title, content, template, MAX_BYTES, log_func=log)
 
 # ── 工具函数（使用 uzi_common 带重试的 HTTP 客户端） ──
 def _fetch_json(url, timeout=15, headers=None):
@@ -116,90 +101,25 @@ def get_us_overnight():
 
 # ── 盘前消息收集 ──
 def collect_premarket_news():
-    """收集盘前消息：金十数据 + 东财快讯 + 东财全球资讯 + 新浪财经"""
+    """收集盘前消息：金十数据 + 东财快讯 + 东财全球资讯 + 新浪财经
+    使用 uzi_common._collect_all_news 统一聚合（V4.2 重构，符合 a-stock-data SKILL）"""
     log("收集盘前消息...")
-    news_items = []
+    from uzi_common import _collect_all_news
 
-    # 金十数据
-    try:
-        url = "https://www.jin10.com/flash_newest.js"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.jin10.com/"})
-        resp = urllib.request.urlopen(req, timeout=15)
-        raw = resp.read().decode("utf-8", errors="replace")
-        match = re.search(r'var newest = (\[.*?\]);', raw, re.DOTALL)
-        if match:
-            items = json.loads(match.group(1))
-            for item in items[:20]:
-                news_items.append({
-                    "title": item.get("title", ""),
-                    "snippet": item.get("content", "") or item.get("title", ""),
-                    "source": "金十数据",
-                    "time": item.get("time", "")
-                })
-            log(f"金十数据: {min(20, len(items))} 条")
-    except Exception as e:
-        log(f"金十数据失败: {e}")
+    # 使用统一聚合接口，自动去重
+    news = _collect_all_news(
+        sources=["jin10", "em_kuaixun", "em_global", "sina_global"],
+        max_per_source={
+            "jin10": 20,
+            "em_kuaixun": 15,
+            "em_global": 15,
+            "sina_global": 10,
+        }
+    )
 
-    # 东财快讯
-    try:
-        url = "https://newsapi.eastmoney.com/kuaixun/v1/getlist_101_ajaxResult_50_1_.html"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://kuaixun.eastmoney.com/"})
-        resp = urllib.request.urlopen(req, timeout=15)
-        raw = resp.read().decode("utf-8", errors="replace")
-        match = re.search(r'var ajaxResult=({.*?});', raw, re.DOTALL)
-        if match:
-            data = json.loads(match.group(1))
-            for item in data.get("LivesList", [])[:15]:
-                news_items.append({
-                    "title": item.get("title", ""),
-                    "snippet": item.get("digest", "") or item.get("title", ""),
-                    "source": "东财快讯",
-                    "time": item.get("showtime", "")
-                })
-            log(f"东财快讯: {min(15, len(data.get('LivesList', [])))} 条")
-    except Exception as e:
-        log(f"东财快讯失败: {e}")
-
-    # 东财全球资讯（7x24，替代财联社）
-    try:
-        from uzi_common import _eastmoney_global_news
-        items = _eastmoney_global_news(page_size=15)
-        if items:
-            for item in items[:15]:
-                news_items.append({
-                    "title": item.get("title", ""),
-                    "snippet": item.get("summary", "") or item.get("title", ""),
-                    "source": "东财全球资讯",
-                })
-            log(f"东财全球资讯: {min(15, len(items))} 条")
-    except Exception as e:
-        log(f"东财全球资讯失败: {e}")
-
-    # 新浪全球宏观
-    try:
-        url = "https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2516&k=&num=10&page=1"
-        data = _fetch_json(url)
-        if data and data.get("result", {}).get("data"):
-            for item in data["result"]["data"]:
-                news_items.append({
-                    "title": item.get("title", ""),
-                    "snippet": item.get("intro", "") or item.get("title", ""),
-                    "source": "新浪全球宏观"
-                })
-            log(f"新浪全球宏观: {len(data['result']['data'])} 条")
-    except Exception as e:
-        log(f"新浪全球宏观失败: {e}")
-
-    # 去重
-    seen = set()
-    unique = []
-    for item in news_items:
-        key = item.get("title", "")[:30]
-        if key not in seen:
-            seen.add(key)
-            unique.append(item)
-    log(f"盘前消息合计: {len(unique)} 条（去重后）")
-    return unique
+    # 格式适配原有调用（统一格式已经一致）
+    log(f"盘前消息合计: {len(news)} 条（去重后）")
+    return news
 
 # ── 消息面 → 标的映射 ──
 # 格式: (keyword_groups, [(direction, stock, chain, logic)])
@@ -558,7 +478,6 @@ def card_overview(us_data, news_items, all_stocks, bullish_count, bearish_count,
                 lines.append(f"| <font color='{color}'>{s['name']}</font> | <font color='{color}'>{s['chg_pct']:+.2f}%</font> |")
         lines.append("")
 
-    lines.append("数据来源：金十数据 | 东财快讯 | 东财全球资讯 | 新浪全球宏观 | 自动化生成")
     content = "\n".join(lines)
     send_card("🌍 隔夜外盘", content, "blue")
 
@@ -822,7 +741,6 @@ def card_theme_preview(news_stock_map, us_data):
 def main():
     log("=" * 60)
     log("每日早盘简报启动 v4")
-    fetch_latest_skill()
 
     today = datetime.now()
     today_str = today.strftime("%Y%m%d")
@@ -918,9 +836,7 @@ def main():
 ▸ 消息面主导：利好/利空方向决定日内板块轮动
 ▸ 关注开盘后资金流向确认
 
----
-数据来源：金十数据、东财快讯、新浪财经、东方财富
-声明：以上内容仅供市场信息参考，不构成任何投资建议"""
+"""
     send_card("🧠 早盘研判", judgment, "purple")
 
     log("每日早盘简报完成")

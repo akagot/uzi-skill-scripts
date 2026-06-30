@@ -16,16 +16,21 @@ sys.path.insert(0, str(Path(__file__).parent))
 from uzi_common import (
     _index_quotes, _sector_spot_sina, _a_share_active_stocks,
     _us_sector_etf_quotes, _theme_heat_safe,
+    _ths_north_bound, _sector_rank_safe, _hot_rank_safe,
+    _mootdx_quotes, A_SHARE_BLUE_CHIPS,
     send_feishu_card, color_chg, fmt_price, is_trading_day, make_logger,
     fetch_latest_skill,
     US_TECH_LEADERS, fetch_qt_quotes,
+    _index_tech_analysis, _index_tech_card,
+    _market_breadth, _market_breadth_card,
+    _em_hot_rank_v2,
 )
 
 LOG_FILE = Path("/tmp/uzi_morning_analysis.log")
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/96d30f0a-639b-40c8-8ed5-1028ea80bef9"
 log = make_logger(LOG_FILE)
 
-# ── 1. 竞价概览（指数 + 隔夜美股参考）──
+# ── 1. 竞价概览（指数 + 隔夜美股参考 + 技术分析）──
 def get_overview():
     indices = _index_quotes()
     # 隔夜美股
@@ -33,8 +38,12 @@ def get_overview():
     us_idx_map = {}
     for q in us_indices:
         us_idx_map[q["code"]] = q
-    log(f"指数: {len(indices)} 条, 美股指数: {len(us_indices)} 条")
-    return indices, us_idx_map
+    # 上证技术分析
+    tech = _index_tech_analysis()
+    # 市场情绪
+    breadth = _market_breadth()
+    log(f"指数: {len(indices)} 条, 美股指数: {len(us_indices)} 条, 技术分析: {'有' if tech else '无'}, 情绪: {'有' if breadth else '无'}")
+    return indices, us_idx_map, tech, breadth
 
 # ── 2. 题材热度（昨日涨停行业 + 连板题材 + 新浪行业）──
 def get_theme_heat():
@@ -45,13 +54,33 @@ def get_theme_heat():
 # ── 3. 竞价异动（活跃股）──
 def get_auction_stocks():
     stocks = _a_share_active_stocks()
+    if not stocks:
+        log("活跃股数据为空，使用 mootdx fallback")
+        codes = [c for c, _ in A_SHARE_BLUE_CHIPS]
+        quotes = _mootdx_quotes(codes)
+        if quotes:
+            stocks = []
+            for code, name in A_SHARE_BLUE_CHIPS:
+                q = quotes.get(code)
+                if q and q.get("price"):
+                    prev_close = q.get("prev_close")
+                    price = q.get("price")
+                    change_pct = None
+                    if prev_close and prev_close > 0:
+                        change_pct = round((price - prev_close) / prev_close * 100, 2)
+                    stocks.append({
+                        "name": name,
+                        "code": code,
+                        "price": price,
+                        "change_pct": change_pct,
+                    })
     valid = [s for s in stocks if s.get("change_pct") is not None]
     up = sorted(valid, key=lambda x: -x["change_pct"])[:8]
     down = sorted(valid, key=lambda x: x["change_pct"])[:8]
     return up, down
 
 # ── 推送卡片 ──
-def card_overview(indices, us_idx_map):
+def card_overview(indices, us_idx_map, tech=None, breadth=None):
     lines = ["**📊 竞价·大盘指数**\n"]
     if indices:
         lines.append("| 指数 | 点位 | 涨跌幅 |")
@@ -60,6 +89,27 @@ def card_overview(indices, us_idx_map):
             lines.append(f"| **{idx['name']}** | {fmt_price(idx.get('price'))} | {color_chg(idx.get('chg_pct'))} |")
     else:
         lines.append("<font color='orange'>⚠️ 指数数据获取失败</font>")
+
+    # 上证技术分析
+    tech_card = _index_tech_card(tech)
+    if tech_card:
+        lines.append(tech_card)
+
+    # 市场情绪
+    breadth_card = _market_breadth_card(breadth)
+    if breadth_card:
+        lines.append(breadth_card)
+
+    # 北向资金流向
+    north = _ths_north_bound()
+    if north:
+        lines.append("\n**🇨🇳 北向资金**")
+        lines.append(f"沪股通：{north['sh']:+.2f}亿 | 深股通：{north['sz']:+.2f}亿 | 合计：{north['total']:+.2f}亿")
+        if north.get("consecutive", 0) > 0:
+            lines.append(f"连续{north['consecutive']}日{north['direction']} | 5日均值：{north['ma5']:+.2f}亿")
+    else:
+        lines.append("\n**🇨🇳 北向资金**")
+        lines.append("北向资金数据暂不可用")
 
     lines.append("\n**🇺🇸 隔夜美股**")
     lines.append("| 名称 | 代码 | 现价 | 涨跌幅 |")
@@ -115,6 +165,11 @@ def card_theme_heat(heat):
 
     # 人气榜
     hot_rank = heat.get("hot_rank")
+    if hot_rank is None:
+        hot_rank = _hot_rank_safe()
+    if hot_rank is None:
+        # fallback to v2
+        hot_rank = _em_hot_rank_v2(5)
     if hot_rank:
         lines.append("\n**🔥 人气榜 TOP5**")
         lines.append("| 排名 | 名称 | 涨跌幅 | 概念 |")
@@ -203,25 +258,22 @@ def card_judgment(indices, heat, up, down):
 • 若竞价异动与涨停方向重合 → 资金共识强
 • 若竞价大幅低开 → 关注防御性板块（医药/消费/公用事业）
 
----
-数据来源：新浪行业 · 腾讯财经 · akshare
-声明：以上内容仅供市场信息参考，不构成任何投资建议"""
+"""
     send_feishu_card(FEISHU_WEBHOOK, "🧠 早盘研判", body, "purple", log=log)
 
 
 def main():
     log("=" * 60)
     log("早盘竞价+大盘分析启动 v4")
-    fetch_latest_skill()
     if not is_trading_day():
         log("今日非交易日，跳过")
         return
 
-    indices, us_idx_map = get_overview()
+    indices, us_idx_map, tech, breadth = get_overview()
     heat = get_theme_heat()
     up, down = get_auction_stocks()
 
-    card_overview(indices, us_idx_map)
+    card_overview(indices, us_idx_map, tech, breadth)
     time.sleep(0.5)
     card_theme_heat(heat)
     time.sleep(0.5)

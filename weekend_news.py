@@ -20,9 +20,12 @@ from pathlib import Path
 # ── 共享工具 ──
 sys.path.insert(0, str(Path(__file__).parent))
 from uzi_common import (
-    _http_get_text, send_feishu_card, is_trading_day, make_logger,
+    _http_get_text, send_feishu_card, send_card as _send_card, is_trading_day, make_logger,
     _theme_heat_safe, _index_quotes, color_chg, fmt_price,
     fetch_latest_skill,
+    _index_tech_analysis, _index_tech_card,
+    _market_breadth, _market_breadth_card,
+    _cninfo_announcements, _ths_north_bound,
 )
 
 # ── 配置 ──
@@ -43,9 +46,7 @@ def log(msg):
         pass
 
 # ── 飞书卡片（转发到 uzi_common） ──
-def send_card(title, content, template="blue"):
-    """包装 uzi_common.send_feishu_card"""
-    return send_feishu_card(FEISHU_WEBHOOK, title, content, template, MAX_BYTES, log=log)
+send_card = lambda title, content, template="blue": _send_card(FEISHU_WEBHOOK, title, content, template, MAX_BYTES, log_func=log)
 
 def send_text(title, content):
     try:
@@ -88,43 +89,38 @@ def _fetch_json(url, headers=None, timeout=15):
         return None
 
 def collect_weekend_news():
+    """收集周末消息面：新浪4频道 + 金十数据 + 东财全球资讯
+    使用 uzi_common._collect_all_news 统一聚合（V4.2 重构，符合 a-stock-data SKILL）"""
     log("开始收集周末消息面...")
-    news_items = []
+    from uzi_common import _collect_all_news
 
-    sources = [
-        ("财经要闻", "2509"),
-        ("A股聚焦", "2512"),
-        ("产经动态", "2515"),
-        ("全球宏观", "2516"),
-    ]
+    # 新浪4频道 + 金十 + 东财全球资讯，统一聚合自动去重
+    news = _collect_all_news(
+        sources=["jin10", "em_global", "sina_yaowen", "sina_agu", "sina_chanjing", "sina_global"],
+        max_per_source={
+            "jin10": 20,
+            "em_global": 15,
+            "sina_yaowen": 15,
+            "sina_agu": 15,
+            "sina_chanjing": 15,
+            "sina_global": 15,
+        }
+    )
 
-    for cat_name, lid in sources:
-        try:
-            data = _fetch_json(f"https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid={lid}&k=&num=15&page=1")
-            if data and data.get("result", {}).get("data"):
-                for item in data["result"]["data"]:
-                    news_items.append({
-                        "category": cat_name,
-                        "title": item.get("title", ""),
-                        "snippet": item.get("intro", "") or item.get("title", ""),
-                        "url": item.get("url", ""),
-                        "source": "新浪财经"
-                    })
-                log(f"新浪财经{cat_name}: {len(data['result']['data'])} 条")
-        except Exception as e:
-            log(f"新浪财经{cat_name}失败: {e}")
+    # 按来源映射 category（保持向后兼容）
+    source_to_cat = {
+        "金十数据": "财经快讯",
+        "东财全球资讯": "全球资讯",
+        "新浪财经要闻": "财经要闻",
+        "新浪A股聚焦": "A股聚焦",
+        "新浪产经动态": "产经动态",
+        "新浪全球宏观": "全球宏观",
+    }
+    for n in news:
+        n["category"] = source_to_cat.get(n.get("source", ""), "综合资讯")
 
-    # 去重
-    seen = set()
-    unique = []
-    for item in news_items:
-        key = item.get("title", "")[:30]
-        if key not in seen:
-            seen.add(key)
-            unique.append(item)
-    news_items = unique
-    log(f"收集到 {len(news_items)} 条消息（去重后）")
-    return news_items
+    log(f"收集到 {len(news)} 条消息（去重后，6源聚合）")
+    return news
 
 # ── 消息面 → 标的映射 ──
 # 格式: (keyword_groups, [(direction, stock, chain, logic)])
@@ -379,6 +375,18 @@ def card_weekly_review(last_trade_date_str):
     lines.append(f"**市场情绪判断：**")
     lines.append(f"<font color='{sentiment_color}'>{sentiment}</font>")
     lines.append(f"上涨 {up_count} 只 / 下跌 {down_count} 只 / 持平 {flat_count} 只")
+
+    # 上证技术分析
+    tech = _index_tech_analysis()
+    tech_card = _index_tech_card(tech)
+    if tech_card:
+        lines.append(tech_card)
+
+    # 市场情绪
+    breadth = _market_breadth()
+    breadth_card = _market_breadth_card(breadth)
+    if breadth_card:
+        lines.append(breadth_card)
 
     content = "\n".join(lines)
     send_card("📊 本周复盘", content, "blue")
@@ -797,11 +805,6 @@ def card_next_week_strategy(news_stock_map, last_trade_date_str):
         lines.append("• 利好板块高开不追，等回调确认")
         lines.append("• 利空板块若低开过多可关注超跌反弹")
 
-    lines.append("")
-    lines.append("---")
-    lines.append("数据来源：新浪财经 · 自动化生成")
-    lines.append("声明：以上内容仅供市场信息参考，不构成任何投资建议")
-
     content = "\n".join(lines)
     send_card("🧠 下周策略", content, "purple")
 
@@ -827,11 +830,54 @@ def _find_last_trading_day(today):
     return d.strftime("%Y%m%d")
 
 
+def card_announcements(news_stock_map):
+    """公告卡片：关注标的的最新巨潮公告"""
+    # 收集所有映射出的标的
+    all_codes = set()
+    for item, stocks in news_stock_map:
+        for stock_name, chain, logic, d, kw in stocks:
+            # 提取6位代码
+            import re
+            m = re.search(r'(\d{6})', stock_name)
+            if m:
+                all_codes.add(m.group(1))
+
+    if not all_codes:
+        return
+
+    lines = ["**📋 明日关注标的 · 最新公告**\n"]
+    lines.append("| 标的 | 公告 | 日期 |")
+    lines.append("|------|------|------|")
+
+    found = 0
+    for code in list(all_codes)[:10]:
+        anns = _cninfo_announcements(code, page_size=3)
+        if anns:
+            for a in anns[:3]:
+                name = next((s[0] for _, stocks in news_stock_map for s in stocks if code in s[0]), code)
+                short_name = name.split("(")[0] if "(" in name else name
+                title = a["title"][:30]
+                if len(a["title"]) > 30:
+                    title += "..."
+                date_str = a["date"][-5:] if a["date"] else "-"
+                lines.append(f"| {short_name} | {title} | {date_str} |")
+                found += 1
+                if found >= 15:
+                    break
+        if found >= 15:
+            break
+
+    if found == 0:
+        return
+
+    lines.append(f"\n<font color='grey'>共 {found} 条公告，数据来源：巨潮资讯</font>")
+    send_card("📋 公告速览", "\n".join(lines), "purple")
+
+
 # ── 主流程 ──
 def main():
     log("=" * 60)
     log("周末消息面汇总启动 v4")
-    fetch_latest_skill()
 
     today = datetime.now()
     today_str = today.strftime("%Y%m%d")
@@ -897,8 +943,12 @@ def main():
 
     # 7. 卡片 4: 下周策略 (purple)
     card_next_week_strategy(news_stock_map, last_trade_date)
+    time.sleep(0.5)
 
-    log("周末消息面汇总完成（4 卡片）")
+    # 8. 卡片 5: 公告速览 (purple)
+    card_announcements(news_stock_map)
+
+    log("周末消息面汇总完成（5 卡片）")
 
 
 if __name__ == "__main__":
