@@ -25,6 +25,7 @@ from uzi_common import (
     _index_tech_analysis, _index_tech_card,
     _market_breadth, _market_breadth_card,
     _limit_up_sentiment_v2, _em_hot_rank_v2,
+    _us_a_linkage, _us_a_linkage_card,
 )
 
 LOG_FILE = Path("/tmp/uzi_close_analysis.log")
@@ -345,6 +346,15 @@ def card_strategy(indices, heat, late_stocks):
     if late_stocks:
         late_names = "、".join(s["name"] for s in late_stocks[:3])
         lines.append(f"| 尾盘抢筹 | {late_names} |")
+
+    # 美股→A股联动复盘
+    linkage = _us_a_linkage()
+    if linkage:
+        from uzi_common import _us_a_linkage_card
+        card = _us_a_linkage_card(linkage, compact=True)
+        if card:
+            lines.append("")
+            lines.append(card)
 
     lines.append("")
 

@@ -18,7 +18,7 @@ from pathlib import Path
 
 # ── 共享工具 ──
 sys.path.insert(0, str(Path(__file__).parent))
-from uzi_common import _http_get_text, send_feishu_card, send_card as _send_card, is_trading_day, make_logger, _theme_heat_safe, _index_quotes, fetch_latest_skill
+from uzi_common import _http_get_text, send_feishu_card, send_card as _send_card, is_trading_day, make_logger, _theme_heat_safe, _index_quotes, fetch_latest_skill, _us_a_linkage, _us_a_linkage_card
 
 # ── 配置 ──
 LOG_FILE = Path("/tmp/uzi_morning_briefing.log")
@@ -302,31 +302,26 @@ def build_us_mapping(us_data):
 
     if us_data.get("stocks"):
         lines.append("**重点个股 → A股映射**")
-        us_to_a = {
-            "NVDA": ("寒武纪(688256)", "中际旭创(300308)"),
-            "AAPL": ("立讯精密(002475)", "蓝思科技(300433)"),
-            "TSLA": ("拓普集团(601689)", "三花智控(002050)"),
-            "MSFT": ("金山办公(688111)", "科大讯飞(002230)"),
-            "MU": ("兆易创新(603986)", "江波龙(301308)"),
-            "AMD": ("通富微电(002156)", "中科曙光(603019)"),
-            "ASML": ("北方华创(002371)", "中微公司(688012)"),
-            "GOOGL": ("中文在线(300364)", "蓝色光标(300058)"),
-            "META": ("蓝色光标(300058)", "易点天下(301171)"),
-            "AMZN": ("跨境通(002640)", "焦点科技(002315)"),
-            "BABA": ("阿里巴巴(BABA)", "腾讯控股(00700.HK)"),
-            "PDD": ("阿里巴巴(BABA)", "京东(JD)"),
-            "JD": ("京东(JD)", "阿里巴巴(BABA)"),
-            "NIO": ("比亚迪(002594)", "长城汽车(601633)"),
-            "XPEV": ("比亚迪(002594)", "长城汽车(601633)"),
-            "BIDU": ("中文在线(300364)", "三六零(601360)"),
-        }
-        for stock in us_data["stocks"][:10]:
-            code = stock["code"]
-            a_stocks = us_to_a.get(code, [])
-            if a_stocks:
+        # 使用共享的联动分析引擎
+        linkage = _us_a_linkage()
+        if linkage:
+            card = _us_a_linkage_card(linkage, compact=True)
+            if card:
+                lines.append(card)
+        else:
+            # fallback: 旧版硬编码映射
+            from uzi_common import US_TO_A_MAP
+            seen = set()
+            for stock in us_data["stocks"][:10]:
+                code = stock["code"]
+                if code in seen:
+                    continue
+                seen.add(code)
                 color = "red" if stock["chg_pct"] >= 0 else "green"
                 arrow = "📈" if stock["chg_pct"] >= 0 else "📉"
-                lines.append(f"  {arrow} <font color='{color}'>{stock['name']}({code})</font> {stock['chg_pct']:+.2f}% → {', '.join(a_stocks)}")
+                a_matches = [f"{a_name}({a_code})" for _, _, a_code, a_name, _, _ in US_TO_A_MAP if _ == code]
+                a_str = "、".join(a_matches[:2]) if a_matches else "—"
+                lines.append(f"  {arrow} <font color='{color}'>{stock['name']}({code})</font> {stock['chg_pct']:+.2f}% → {a_str}")
 
     return "\n".join(lines) if lines else "美股数据获取失败"
 

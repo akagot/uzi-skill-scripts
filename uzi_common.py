@@ -56,6 +56,240 @@ def _http_get_bytes(url, timeout=15, retries=3, extra_headers=None):
     print(f"[HTTP FAIL] {url[:80]}: {last_err}", file=sys.stderr)
     return None
 
+
+# ═══════════════════════════════════════════════════════════════
+# 美股→A股联动分析 · 隔夜美股映射A股今日走势
+# ═══════════════════════════════════════════════════════════════
+
+def _us_a_linkage():
+    """美股→A股联动分析
+    拉取美股科技股隔夜涨跌幅 + A股对应映射标的今日走势
+    返回: {
+        us_stocks: [{code, name, chg_pct, sector, a_stocks: [{code, name, chg_pct, sector}]}],
+        summary: {us_up, us_down, a_up, a_down, same_direction, divergence},
+        sox: {price, chg_pct} | None,
+        a_indices: [{name, chg_pct}] | None,
+    }
+    """
+    # 1. 拉取美股（隔夜收盘）
+    us_codes = list(_US_TO_A_GROUPED.keys()) + ["SOX"]
+    us_qt_codes = "t_us" + ",t_us".join(us_codes)
+    try:
+        req = urllib.request.Request(
+            f"https://qt.gtimg.cn/q={us_qt_codes}",
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        raw = urllib.request.urlopen(req, timeout=10).read().decode("gbk")
+    except Exception as e:
+        print(f"[US-A LINK] 美股拉取失败: {e}", file=sys.stderr)
+        return None
+
+    us_data = {}
+    for line in raw.strip().split("\n"):
+        parts = line.split("~")
+        if len(parts) < 35:
+            continue
+        code = parts[2].split(".")[0]
+        us_data[code] = {
+            "price": float(parts[3]) if parts[3] else None,
+            "prev_close": float(parts[4]) if parts[4] else None,
+            "chg_pct": float(parts[32]) if parts[32] else None,
+        }
+
+    # 2. 拉取A股映射标的（今日实时）
+    a_qt_codes = ",".join(
+        f"sh{a}" if a.startswith("6") else f"sz{a}"
+        for a in _A_LINKAGE_CODES
+    )
+    try:
+        req2 = urllib.request.Request(
+            f"https://qt.gtimg.cn/q={a_qt_codes}",
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        raw2 = urllib.request.urlopen(req2, timeout=10).read().decode("gbk")
+    except Exception as e:
+        print(f"[US-A LINK] A股拉取失败: {e}", file=sys.stderr)
+        return None
+
+    a_data = {}
+    for line in raw2.strip().split("\n"):
+        parts = line.split("~")
+        if len(parts) < 35:
+            continue
+        code = parts[2]  # qt返回纯数字
+        a_data[code] = {
+            "name": parts[1],
+            "price": float(parts[3]) if parts[3] else None,
+            "chg_pct": float(parts[32]) if parts[32] else None,
+        }
+
+    # 3. 组装联动数据
+    result = []
+    us_up = us_down = a_up = a_down = same = 0
+    seen_a = set()
+
+    for us_code, info in _US_TO_A_GROUPED.items():
+        us = us_data.get(us_code, {})
+        us_chg = us.get("chg_pct")
+        if us_chg is None:
+            continue
+
+        us_name = info["name"]
+        a_items = []
+        for a_code, a_name, sector, logic in info["a_stocks"]:
+            a = a_data.get(a_code, {})
+            a_chg = a.get("chg_pct")
+            a_items.append({
+                "code": a_code, "name": a_name, "chg_pct": a_chg,
+                "sector": sector, "logic": logic,
+            })
+            if a_chg is not None and a_code not in seen_a:
+                seen_a.add(a_code)
+                if a_chg > 0.1:
+                    a_up += 1
+                elif a_chg < -0.1:
+                    a_down += 1
+
+        result.append({
+            "code": us_code, "name": us_name, "chg_pct": us_chg,
+            "a_stocks": a_items,
+        })
+
+        if us_chg > 0.1:
+            us_up += 1
+        elif us_chg < -0.1:
+            us_down += 1
+
+    # 计算同向联动
+    for item in result:
+        us_chg = item["chg_pct"]
+        if us_chg is None:
+            continue
+        for a in item["a_stocks"]:
+            a_chg = a["chg_pct"]
+            if a_chg is None:
+                continue
+            if (us_chg > 0.1 and a_chg > 0.1) or (us_chg < -0.1 and a_chg < -0.1):
+                same += 1
+                break
+
+    # 4. SOX指数
+    sox = us_data.get("SOX", {})
+    sox_info = None
+    if sox.get("price"):
+        sox_info = {"price": sox["price"], "chg_pct": sox.get("chg_pct")}
+
+    # 5. A股大盘
+    a_indices = None
+    try:
+        a_indices = _index_quotes()
+    except Exception:
+        pass
+
+    return {
+        "us_stocks": result,
+        "summary": {
+            "us_up": us_up, "us_down": us_down,
+            "a_up": a_up, "a_down": a_down,
+            "same_direction": same,
+            "total": len(result) if result else 0,
+        },
+        "sox": sox_info,
+        "a_indices": a_indices,
+    }
+
+
+def _us_a_linkage_card(linkage, compact=False):
+    """美股→A股联动分析 → 飞书卡片 Markdown
+    compact=True: 精简版（用于 morning_briefing 隔夜外盘卡片内嵌）
+    compact=False: 完整版（独立卡片，含联动统计）
+    """
+    if not linkage or not linkage.get("us_stocks"):
+        return None
+
+    us_stocks = linkage["us_stocks"]
+    summary = linkage.get("summary", {})
+    sox = linkage.get("sox")
+    a_indices = linkage.get("a_indices")
+
+    lines = []
+
+    if compact:
+        # 精简版：只显示美股涨跌和A股映射方向
+        lines.append("\n**🔗 美股→A股映射**")
+        # 按美股涨跌幅排序
+        sorted_stocks = sorted(us_stocks, key=lambda x: abs(x.get("chg_pct", 0)), reverse=True)
+        shown = 0
+        for item in sorted_stocks[:10]:
+            us_chg = item.get("chg_pct")
+            if us_chg is None:
+                continue
+            us_dir = "🔴" if us_chg > 0 else "🟢"
+            a_names = []
+            for a in item["a_stocks"][:2]:
+                a_chg = a.get("chg_pct")
+                if a_chg is not None:
+                    a_names.append(f"{a['name']}({a_chg:+.1f}%)")
+                else:
+                    a_names.append(a["name"])
+            a_str = "、".join(a_names)
+            lines.append(f"  {us_dir} **{item['name']}** {us_chg:+.2f}% → {a_str}")
+            shown += 1
+
+        if shown < len(sorted_stocks):
+            lines.append(f"  … 共 {len(sorted_stocks)} 只美股映射")
+
+        if sox and sox.get("chg_pct") is not None:
+            sox_dir = "📈" if sox["chg_pct"] > 0 else "📉"
+            lines.append(f"  {sox_dir} 费城半导体指数 SOX: {sox['chg_pct']:+.2f}%")
+
+        return "\n".join(lines)
+
+    # 完整版：含联动统计 + A股大盘
+    lines.append("**🔗 美股→A股科技映射联动**\n")
+
+    # 统计行
+    if summary:
+        lines.append(f"美股: 涨{summary['us_up']}跌{summary['us_down']} | "
+                     f"A股映射: 涨{summary['a_up']}跌{summary['a_down']} | "
+                     f"同向联动: {summary['same_direction']}/{summary['total']}")
+
+    if sox and sox.get("chg_pct") is not None:
+        sox_dir = "📈" if sox["chg_pct"] > 0 else "📉"
+        lines.append(f"费城半导体: {sox_dir} {sox['chg_pct']:+.2f}%")
+
+    lines.append("")
+
+    # 按美股涨跌幅度排序，只显示涨跌幅>0.5%的
+    sorted_stocks = sorted(us_stocks, key=lambda x: abs(x.get("chg_pct", 0)), reverse=True)
+    for item in sorted_stocks:
+        us_chg = item.get("chg_pct")
+        if us_chg is None or abs(us_chg) < 0.5:
+            continue
+        us_dir = "🔴" if us_chg > 0 else "🟢"
+        a_strs = []
+        for a in item["a_stocks"]:
+            a_chg = a.get("chg_pct")
+            if a_chg is not None:
+                a_strs.append(f"{a['name']}({a_chg:+.1f}%)")
+            else:
+                a_strs.append(a["name"])
+        lines.append(f"  {us_dir} **{item['name']}** {us_chg:+.2f}% → {'、'.join(a_strs[:2])}")
+
+    # A股大盘
+    if a_indices:
+        lines.append("\n**A股大盘**")
+        idx_strs = []
+        for idx in a_indices:
+            name = idx["name"]
+            chg = idx.get("chg_pct")
+            if chg is not None:
+                idx_strs.append(f"{name}({chg:+.2f}%)")
+        if idx_strs:
+            lines.append("  " + " | ".join(idx_strs))
+
+    return "\n".join(lines)
+
 def _http_get_text(url, timeout=15, retries=3, encoding="utf-8", extra_headers=None):
     raw = _http_get_bytes(url, timeout=timeout, retries=retries, extra_headers=extra_headers)
     if raw is None:
@@ -423,6 +657,63 @@ US_TECH_LEADERS = [
     ("AVGO", "博通"), ("ORCL", "甲骨文"), ("CRM", "Salesforce"),
     ("INTC", "英特尔"), ("CSCO", "思科"),
 ]
+
+# ═══ 美股→A股映射表（半导体/芯片/科技/新能源/消费电子） ═══
+# 格式: (美股代码, 美股名称, A股代码, A股名称, 板块, 映射逻辑)
+US_TO_A_MAP = [
+    # ── 半导体设备 ──
+    ("KLAC",  "科磊",     "688120", "华海清科", "检测设备", "CMP/检测设备国产替代"),
+    ("AMAT",  "应用材料", "002371", "北方华创", "半导体设备", "刻蚀/薄膜/清洗设备龙头"),
+    ("LRCX",  "泛林",     "002371", "北方华创", "半导体设备", "刻蚀机国产替代"),
+    ("ASML",  "阿斯麦",   "688012", "中微公司", "光刻机", "国产刻蚀机/光刻机概念"),
+    # ── AI芯片/GPU ──
+    ("NVDA",  "英伟达",   "688041", "海光信息", "GPU/AI", "国产GPU/DCU双龙头"),
+    ("NVDA",  "英伟达",   "688256", "寒武纪",   "AI芯片", "国产AI训练/推理芯片"),
+    ("AMD",   "AMD",      "688041", "海光信息", "CPU/GPU", "x86国产替代"),
+    ("MRVL",  "美满",     "688008", "澜起科技", "AI芯片", "PCIe Retimer/内存接口"),
+    # ── 晶圆代工 ──
+    ("TSM",   "台积电",   "688981", "中芯国际", "晶圆代工", "大陆晶圆代工龙头"),
+    ("INTC",  "英特尔",   "688981", "中芯国际", "晶圆代工", "先进制程国产替代"),
+    # ── 存储芯片 ──
+    ("MU",    "美光",     "603986", "兆易创新", "存储芯片", "NOR Flash/MCU龙头"),
+    ("MU",    "美光",     "301308", "江波龙",   "存储芯片", "存储模组龙头"),
+    # ── 模拟芯片 ──
+    ("TXN",   "德州仪器", "300661", "圣邦股份", "模拟芯片", "国产模拟芯片龙头"),
+    ("ADI",   "亚德诺",   "300661", "圣邦股份", "模拟芯片", "信号链/电源管理"),
+    # ── 网络芯片 ──
+    ("AVGO",  "博通",     "000938", "紫光股份", "网络芯片", "交换机/路由器"),
+    ("AVGO",  "博通",     "688702", "盛科通信", "网络芯片", "国产交换芯片"),
+    # ── 手机芯片 ──
+    ("QCOM",  "高通",     "603501", "韦尔股份", "手机芯片", "CIS图像传感器"),
+    # ── IP授权 ──
+    ("ARM",   "ARM",      "688521", "芯原股份", "IP授权", "芯片设计IP平台"),
+    # ── 消费电子 ──
+    ("AAPL",  "苹果",     "002475", "立讯精密", "消费电子", "苹果产业链核心"),
+    ("AAPL",  "苹果",     "300433", "蓝思科技", "消费电子", "苹果玻璃盖板"),
+    # ── AI/云 ──
+    ("MSFT",  "微软",     "688111", "金山办公", "AI/云", "国产办公软件/AI"),
+    ("GOOGL", "谷歌",     "002230", "科大讯飞", "AI", "AI语音/大模型"),
+    ("AMZN",  "亚马逊",   "002415", "海康威视", "云/AI", "AI视觉/云计算"),
+    # ── AI应用 ──
+    ("META",  "Meta",     "300624", "万兴科技", "AI应用", "创意软件/AI"),
+    # ── 汽车/机器人 ──
+    ("TSLA",  "特斯拉",   "601689", "拓普集团", "汽车/机器人", "特斯拉供应链"),
+    ("TSLA",  "特斯拉",   "002050", "三花智控", "汽车/机器人", "热管理供应商"),
+    # ── 光模块（AI算力出海） ──
+    ("NVDA",  "英伟达",   "300308", "中际旭创", "光模块", "800G/1.6T光模块龙头"),
+    ("NVDA",  "英伟达",   "300502", "新易盛",   "光模块", "光模块核心供应商"),
+    ("NVDA",  "英伟达",   "300394", "天孚通信", "光模块", "光器件核心供应商"),
+]
+
+# 去重后的A股映射标的（用于批量查询，按美股分组）
+_US_TO_A_GROUPED = {}
+for us_code, us_name, a_code, a_name, sector, logic in US_TO_A_MAP:
+    if us_code not in _US_TO_A_GROUPED:
+        _US_TO_A_GROUPED[us_code] = {"name": us_name, "a_stocks": []}
+    _US_TO_A_GROUPED[us_code]["a_stocks"].append((a_code, a_name, sector, logic))
+
+# 去重A股标的列表
+_A_LINKAGE_CODES = list(set(a_code for _, _, a_code, _, _, _ in US_TO_A_MAP))
 
 HK_TECH_LEADERS = [
     ("00700", "腾讯控股"), ("09988", "阿里巴巴"),

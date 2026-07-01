@@ -24,6 +24,7 @@ from uzi_common import (
     _index_tech_analysis, _index_tech_card,
     _market_breadth, _market_breadth_card,
     _em_hot_rank_v2,
+    _us_a_linkage, _us_a_linkage_card,
 )
 
 LOG_FILE = Path("/tmp/uzi_morning_analysis.log")
@@ -121,6 +122,13 @@ def card_overview(indices, us_idx_map, tech=None, breadth=None):
             lines.append(f"| {name} | {code} | {price_str} | {color_chg(q.get('change_pct'))} |")
         else:
             lines.append(f"| {name} | {code} | - | <font color='grey'>--</font> |")
+
+    # 美股→A股联动映射
+    linkage = _us_a_linkage()
+    if linkage:
+        linkage_card = _us_a_linkage_card(linkage, compact=True)
+        if linkage_card:
+            lines.append(linkage_card)
 
     lines.append("\n---")
     lines.append("<font color='grey'>数据：新浪行业 · 腾讯 qt  |  仅供参考</font>")
